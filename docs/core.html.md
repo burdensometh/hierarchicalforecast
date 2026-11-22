@@ -23,6 +23,38 @@ method](https://nixtlaverse.nixtla.io/hierarchicalforecast/utils.html#aggregate)
       members:
         - reconcile
         - bootstrap_reconcile
+        - reconcile_ratio
+
+::: hierarchicalforecast.core.reconcile_ratio
+
+### Reconciling ratios
+
+A rate such as a conversion rate is a ratio of two coherent quantities, e.g.
+orders over visits. Averaging store rates distorts the aggregate whenever the
+number of stores or their visit volumes change. `reconcile_ratio` reconciles
+the numerator and the denominator separately on the same `(series, timestamp)`
+grid, then derives the rate from the two reconciled columns, so every level
+reports a pooled rate.
+
+```python
+from hierarchicalforecast.core import HierarchicalReconciliation
+from hierarchicalforecast.methods import BottomUp
+
+hrec = HierarchicalReconciliation([BottomUp()])
+rate_df = hrec.reconcile_ratio(
+    numerator_df=orders_df,       # ['unique_id', 'ds', 'orders']
+    denominator_df=visits_df,     # ['unique_id', 'ds', 'visits']
+    S_df=S_df,
+    tags=tags,
+    numerator_col='orders',
+    denominator_col='visits',
+)
+# Columns: level, unique_id, ds, model, numerator, denominator, rate
+```
+
+The report always includes the numerator and the denominator next to the rate.
+A level with zero visits has a missing rate, and any series or timestamp that
+appears on only one side raises a `ValueError` before reconciliation starts.
 
 ### Example
 

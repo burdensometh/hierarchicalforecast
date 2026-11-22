@@ -1,4 +1,4 @@
-__all__ = ['HierarchicalReconciliation']
+__all__ = ['HierarchicalReconciliation', 'reconcile_ratio']
 
 
 import re
@@ -220,6 +220,198 @@ def _estimate_sigmah(
     sigmah = np.mean(sigma_estimates, axis=0)
     sigmah = np.maximum(sigmah, 0)
     return sigmah
+
+
+def _ratio_pairing_errors(
+    numerator_nw: Frame,
+    denominator_nw: Frame,
+    id_col: str,
+    time_col: str,
+) -> list[str]:
+    """Collect the (series, timestamp) pairs one ratio side is missing.
+
+    Args:
+        numerator_nw: Numerator frame with `id_col` and `time_col`.
+        denominator_nw: Denominator frame with `id_col` and `time_col`.
+        id_col: Column that identifies each series.
+        time_col: Column that identifies each timestamp.
+
+    Returns:
+        A list with one human readable message per side that has unpaired keys.
+        An empty list means both frames describe exactly the same key grid.
+    """
+    keys = [id_col, time_col]
+    numerator_only = numerator_nw.select(keys).join(
+        denominator_nw.select(keys), on=keys, how="anti"
+    )
+    denominator_only = denominator_nw.select(keys).join(
+        numerator_nw.select(keys), on=keys, how="anti"
+    )
+    errors = []
+    if len(numerator_only) > 0:
+        errors.append(
+            f"{len(numerator_only)} row(s) of the numerator have no matching "
+            f"(series, timestamp) in the denominator, e.g. "
+            f"{reprlib.repr(numerator_only.rows()[:5])}."
+        )
+    if len(denominator_only) > 0:
+        errors.append(
+            f"{len(denominator_only)} row(s) of the denominator have no matching "
+            f"(series, timestamp) in the numerator, e.g. "
+            f"{reprlib.repr(denominator_only.rows()[:5])}."
+        )
+    return errors
+
+
+def _validate_ratio_inputs(
+    numerator_nw: Frame,
+    denominator_nw: Frame,
+    id_col: str,
+    time_col: str,
+) -> None:
+    """Validate that numerator and denominator share one key grid.
+
+    The check runs before any reconciliation so that unpaired series or
+    timestamps cannot be silently collapsed into a ratio.
+
+    Raises:
+        ValueError: If a frame has repeated keys, or if the two frames do not
+            cover exactly the same (series, timestamp) pairs.
+    """
+    keys = [id_col, time_col]
+    for name, frame in (
+        ("numerator", numerator_nw),
+        ("denominator", denominator_nw),
+    ):
+        repeated = frame.group_by(keys).agg(nw.len().alias("__count"))
+        repeated = repeated.filter(nw.col("__count") > 1)
+        if len(repeated) > 0:
+            raise ValueError(
+                f"The {name} has repeated (series, timestamp) pairs, e.g. "
+                f"{reprlib.repr(repeated.drop('__count').rows()[:5])}. "
+                "Each pair must appear exactly once."
+            )
+    errors = _ratio_pairing_errors(numerator_nw, denominator_nw, id_col, time_col)
+    if errors:
+        raise ValueError(
+            "The numerator and denominator must cover the same (series, "
+            "timestamp) pairs before reconciliation. " + " ".join(errors)
+        )
+
+
+def _build_ratio_report(
+    reconciled_nw: Frame,
+    model_specs: list[tuple[str, str, str]],
+    tags: dict[str, np.ndarray],
+    id_col: str,
+    time_col: str,
+    ratio_col: str,
+) -> Frame:
+    """Build a per-node rate report from the reconciled ratio columns.
+
+    The numerator and denominator are each reconciled to be coherent, so every
+    node carries a usable pair of values. A node's rate is its own reconciled
+    numerator over its own reconciled denominator. Because both columns are
+    additive, an aggregate node already reports the pooled rate (e.g. total
+    orders over total visits), which avoids averaging store rates and the
+    distortion that comes with it when store volumes shift.
+
+    Args:
+        reconciled_nw: Frame with the reconciled numerator and denominator
+            columns, keyed by `id_col` and `time_col`.
+        model_specs: `(model_name, numerator_col, denominator_col)` entries.
+        tags: Mapping of level name to the series that belong to it.
+        id_col: Column that identifies each series.
+        time_col: Column that identifies each timestamp.
+        ratio_col: Name of the output rate column.
+
+    Returns:
+        Frame with one row per (level, series, timestamp, model) holding the
+        reconciled numerator, the reconciled denominator and the rate. A zero
+        denominator yields a missing rate.
+    """
+    level_frames = []
+    for level_rank, (level_name, level_ids) in enumerate(tags.items()):
+        level_df = reconciled_nw.filter(nw.col(id_col).is_in(level_ids))
+        for model_name, numerator_col, denominator_col in model_specs:
+            rows = level_df.select(
+                nw.lit(level_name).alias("level"),
+                nw.lit(level_rank).alias("__level_rank"),
+                nw.col(id_col),
+                nw.col(time_col),
+                nw.lit(model_name).alias("model"),
+                nw.col(numerator_col).alias("numerator"),
+                nw.col(denominator_col).alias("denominator"),
+            )
+            level_frames.append(rows)
+    report = nw.concat(level_frames, how="vertical")
+    # A zero denominator has no defined rate; report it as missing. Guarding
+    # with `is_finite` also clears 0/0 and infinite ratios.
+    report = report.with_columns(
+        (nw.col("numerator") / nw.col("denominator")).cast(nw.Float64).alias(ratio_col)
+    )
+    report = report.with_columns(
+        (nw.col("denominator") == 0).alias("__zero_denominator")
+    )
+    report = report.with_columns(
+        nw.when(nw.col(ratio_col).is_finite() & ~nw.col("__zero_denominator"))
+        .then(nw.col(ratio_col))
+        .otherwise(nw.lit(None, dtype=nw.Float64))
+        .alias(ratio_col)
+    )
+    report = report.drop("__zero_denominator")
+    report = report.sort(by=["__level_rank", id_col, time_col, "model"])
+    report = report.drop("__level_rank")
+    report = report.select(
+        "level", id_col, time_col, "model", "numerator", "denominator", ratio_col
+    )
+    return report
+
+
+def _resolve_ratio_value_col(
+    frame: Frame,
+    value_col: str | None,
+    id_col: str,
+    time_col: str,
+    side: str,
+    infer: bool = True,
+) -> str:
+    """Resolve the value column of a ratio input frame.
+
+    Args:
+        frame: Input frame with `id_col`, `time_col` and the values.
+        value_col: Explicit value column, or None to auto-detect it.
+        id_col: Column that identifies each series.
+        time_col: Column that identifies each timestamp.
+        side: Either `numerator` or `denominator`, used in error messages.
+        infer: Whether a missing `value_col` may be auto-detected.
+
+    Returns:
+        The name of the value column.
+
+    Raises:
+        ValueError: If the column is missing, ambiguous or not numeric.
+    """
+    candidates = [c for c in frame.columns if c not in (id_col, time_col)]
+    if value_col is None:
+        numeric = [c for c in candidates if frame.schema[c].is_numeric()]
+        if not infer or len(numeric) != 1:
+            raise ValueError(
+                f"Could not infer the value column of the {side}. Pass "
+                f"`{side}_col` explicitly. Numeric candidates: "
+                f"{reprlib.repr(numeric)}."
+            )
+        value_col = numeric[0]
+    if value_col not in frame.columns:
+        raise ValueError(
+            f"`{value_col}` was not found in the {side} columns "
+            f"{reprlib.repr(frame.columns)}."
+        )
+    if not frame.schema[value_col].is_numeric():
+        raise ValueError(
+            f"The {side} column `{value_col}` must be numeric."
+        )
+    return value_col
 
 
 class HierarchicalReconciliation:
@@ -957,3 +1149,218 @@ class HierarchicalReconciliation:
         Y_bootstrap_df = Y_bootstrap_nw.to_native()
 
         return Y_bootstrap_df
+
+    def reconcile_ratio(
+        self,
+        numerator_df: Frame,
+        denominator_df: Frame | None = None,
+        S_df: "Frame | SMatrix" = None,
+        tags: dict[str, np.ndarray] = None,
+        numerator_col: str | None = None,
+        denominator_col: str | None = None,
+        ratio_col: str = "rate",
+        Y_df: Frame | None = None,
+        is_balanced: bool = False,
+        id_col: str = "unique_id",
+        time_col: str = "ds",
+        target_col: str = "y",
+    ) -> FrameT:
+        r"""Reconcile a ratio by reconciling its numerator and denominator.
+
+        A ratio such as a conversion rate (orders over visits) cannot be
+        reconciled directly: averaging store-level rates lets small stores
+        dominate and drifts from the true aggregate rate whenever the number of
+        stores or their visit volumes change. Instead, this method reconciles
+        the numerator and the denominator separately on the same (series,
+        timestamp) pairs, then derives the rate from the two reconciled
+        columns.
+
+        The numerator and denominator must describe exactly the same keys
+        before reconciliation. Series or timestamps present on only one side
+        raise a `ValueError` up front rather than producing a silently mixed
+        result.
+
+        Args:
+            numerator_df (Frame): Base forecasts of the numerator (e.g. orders),
+                with `id_col`, `time_col` and one value column.
+            denominator_df (Frame, optional): Base forecasts of the denominator
+                (e.g. visits), with the same keys as `numerator_df`. When
+                omitted, `numerator_df` must hold both value columns and
+                `denominator_col` must be given.
+            S_df (Frame | SMatrix, optional): Summing matrix, see
+                :meth:`~hierarchicalforecast.core.HierarchicalReconciliation.reconcile`.
+            tags (dict[str, np.ndarray]): Each key is a level and its value the
+                series belonging to that level.
+            numerator_col (str, optional): Value column of `numerator_df`.
+                Inferred when the frame has a single non-key column.
+            denominator_col (str, optional): Value column of `denominator_df`.
+                Inferred when the frame has a single non-key column.
+            ratio_col (str, optional): Name of the rate column in the report.
+                Default is `"rate"`.
+            Y_df (Frame, optional): Training data, required by in-sample
+                reconcilers. It must carry both value columns.
+            is_balanced (bool, optional): Whether `Y_df` is balanced.
+            id_col (str, optional): Series identifier column. Default is
+                `"unique_id"`.
+            time_col (str, optional): Timestamp column. Default is `"ds"`.
+            target_col (str, optional): Target column of `Y_df`. Default `"y"`.
+
+        Returns:
+            Frame: Long-format report with one row per (level, id, time, model)
+            holding `numerator`, `denominator` and `ratio_col`. The numerator
+            and denominator are the reconciled values, so aggregate levels
+            report a pooled rate. A zero denominator yields a missing rate.
+
+        Raises:
+            ValueError: If the two inputs disagree on their (series, timestamp)
+                pairs, contain repeated keys, or a value column is missing.
+        """
+        numerator_nw = nw.from_native(numerator_df)
+        # When both columns live in one frame, reconcile each of them from it.
+        denominator_nw = (
+            numerator_nw if denominator_df is None else nw.from_native(denominator_df)
+        )
+        if tags is None or len(tags) == 0:
+            raise ValueError(
+                "`tags` is required to map each series to its hierarchy level."
+            )
+        keys = [id_col, time_col]
+        for side_name, frame in (
+            ("numerator", numerator_nw),
+            ("denominator", denominator_nw),
+        ):
+            missing = [c for c in keys if c not in frame.columns]
+            if missing:
+                raise ValueError(
+                    f"`{side_name}_df` is missing required column(s) "
+                    f"{reprlib.repr(missing)}."
+                )
+        numerator_value = _resolve_ratio_value_col(
+            numerator_nw, numerator_col, id_col, time_col, "numerator"
+        )
+        # A shared frame needs both columns named explicitly: auto-detection
+        # would see two numeric columns and could not tell them apart.
+        infer_denominator_col = denominator_df is not None
+        denominator_value = _resolve_ratio_value_col(
+            denominator_nw,
+            denominator_col,
+            id_col,
+            time_col,
+            "denominator",
+            infer=infer_denominator_col,
+        )
+        # Fail before reconciliation when the two sides do not line up.
+        _validate_ratio_inputs(numerator_nw, denominator_nw, id_col, time_col)
+
+        # Each side is reconciled on its own so an in-sample method uses that
+        # side's own history. The sides are renamed to internal column names
+        # first so both inputs may legitimately use the same value name
+        # (e.g. both called `y`) without colliding in the joined output.
+        side_frames = {}
+        side_output_col = {}
+        for side_name, frame, value_col in (
+            ("numerator", numerator_nw, numerator_value),
+            ("denominator", denominator_nw, denominator_value),
+        ):
+            internal_col = f"__ratio_{side_name}"
+            side_output_col[side_name] = internal_col
+            side_Y = None
+            if Y_df is not None:
+                Y_nw = nw.from_native(Y_df)
+                if value_col not in Y_nw.columns:
+                    raise ValueError(
+                        f"`Y_df` must contain the {side_name} value column "
+                        f"`{value_col}` so its history can be reconciled."
+                    )
+                # Point the target at this side's history without dropping the
+                # value column that interval methods look up.
+                side_Y = Y_nw.with_columns(
+                    nw.col(value_col).alias(target_col)
+                ).to_native()
+            side_hat = frame.select(
+                nw.col(id_col), nw.col(time_col), nw.col(value_col)
+            ).rename({value_col: internal_col})
+            reconciled_side = self.reconcile(
+                Y_hat_df=side_hat.to_native(),
+                S_df=S_df,
+                tags=tags,
+                Y_df=side_Y,
+                is_balanced=is_balanced,
+                id_col=id_col,
+                time_col=time_col,
+                target_col=target_col,
+            )
+            side_frames[side_name] = nw.from_native(reconciled_side)
+
+        reconciled_nw = side_frames["numerator"].join(
+            side_frames["denominator"], on=keys, how="left"
+        )
+        reconciled_nw = reconciled_nw.sort(by=keys)
+        # `reconcile` names each output `{internal_col}/{method}`; pair the two
+        # sides per method so both reconciled columns line up.
+        model_specs = [
+            (
+                _build_fn_name(reconciler),
+                f"{side_output_col['numerator']}/{_build_fn_name(reconciler)}",
+                f"{side_output_col['denominator']}/{_build_fn_name(reconciler)}",
+            )
+            for reconciler in self.reconcilers
+        ]
+        report = _build_ratio_report(
+            reconciled_nw=reconciled_nw,
+            model_specs=model_specs,
+            tags=tags,
+            id_col=id_col,
+            time_col=time_col,
+            ratio_col=ratio_col,
+        )
+        return report.to_native()
+
+
+def reconcile_ratio(
+    numerator_df: Frame,
+    denominator_df: Frame | None = None,
+    reconcilers: list[HReconciler] | None = None,
+    S_df: "Frame | SMatrix" = None,
+    tags: dict[str, np.ndarray] = None,
+    numerator_col: str | None = None,
+    denominator_col: str | None = None,
+    ratio_col: str = "rate",
+    **kwargs,
+) -> FrameT:
+    """Reconcile a ratio from separately reconciled numerator and denominator.
+
+    Convenience wrapper around
+    :meth:`~hierarchicalforecast.core.HierarchicalReconciliation.reconcile_ratio`.
+
+    Args:
+        numerator_df (Frame): Base forecasts of the numerator (e.g. orders).
+        denominator_df (Frame, optional): Base forecasts of the denominator
+            (e.g. visits). When omitted, `numerator_df` must carry both value
+            columns and `denominator_col` must be given.
+        reconcilers (list[HReconciler]): Reconcilers applied to both columns.
+        S_df (Frame | SMatrix, optional): Summing matrix.
+        tags (dict[str, np.ndarray]): Mapping of level name to its series.
+        numerator_col (str, optional): Value column of `numerator_df`.
+        denominator_col (str, optional): Value column of `denominator_df`.
+        ratio_col (str, optional): Name of the rate column. Default `"rate"`.
+        **kwargs: Forwarded to
+            :meth:`~hierarchicalforecast.core.HierarchicalReconciliation.reconcile_ratio`.
+
+    Returns:
+        Frame: Long-format report with `level`, series id, timestamp, `model`,
+        `numerator`, `denominator` and `ratio_col`.
+    """
+    if reconcilers is None:
+        raise ValueError("`reconcilers` is required.")
+    hrec = HierarchicalReconciliation(reconcilers=reconcilers)
+    return hrec.reconcile_ratio(
+        numerator_df=numerator_df,
+        denominator_df=denominator_df,
+        S_df=S_df,
+        tags=tags,
+        numerator_col=numerator_col,
+        denominator_col=denominator_col,
+        ratio_col=ratio_col,
+        **kwargs,
+    )
