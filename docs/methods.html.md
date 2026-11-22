@@ -197,7 +197,20 @@ test_fail(
       show_root_heading: true
       show_source: true
 
-## 5. Optimal Combination
+## 5. Partial Min-Trace
+
+::: hierarchicalforecast.methods.PartialMinTrace
+    handler: python
+    options:
+      docstring_style: google
+      members:
+        - fit
+        - fit_predict
+      heading_level: 3
+      show_root_heading: true
+      show_source: true
+
+## 6. Optimal Combination
 
 ::: hierarchicalforecast.methods.OptimalCombination
     handler: python
@@ -212,7 +225,7 @@ test_fail(
       show_root_heading: true
       show_source: true
 
-## 6. Emp. Risk Minimization
+## 7. Emp. Risk Minimization
 
 ::: hierarchicalforecast.methods.ERM
     handler: python

@@ -1,5 +1,5 @@
 __all__ = ['BottomUp', 'BottomUpSparse', 'TopDown', 'TopDownSparse', 'MiddleOut', 'MiddleOutSparse', 'MinTrace', 'MinTraceSparse',
-           'OptimalCombination', 'ERM']
+           'PartialMinTrace', 'partial_reconcile', 'OptimalCombination', 'ERM']
 
 
 import warnings
@@ -40,12 +40,17 @@ class HReconciler:
               where nodes can have multiple parents (e.g., BottomUp, MinTrace, ERM)
         P (np.ndarray | None): Projection matrix computed by the reconciliation method.
         sampler: Probabilistic sampler for generating prediction intervals.
+        is_partial_method (bool): Whether this method accepts base forecasts that
+            are missing for some series on some dates. When True, `y_hat` may
+            contain NaN entries, which are treated as "no forecast" (never as
+            zero) and reconciled per date.
         _init_params (dict | None): Stores initialization parameters for method naming.
     """
     fitted = False
     is_sparse_method = False
     insample = False
     is_strictly_hierarchical = False  # Default: supports grouped hierarchies
+    is_partial_method = False
     P = None
     sampler = None
     _init_params: dict | None = None  # Stores initialization parameters for naming
@@ -1951,6 +1956,319 @@ class MinTraceSparse(MinTrace):
         # Set the instance as fitted.
         self.fitted = True
         return self
+
+
+class PartialMinTrace(HReconciler):
+    r"""Partial Minimum Trace Reconciliation Class.
+
+    Channel forecasts are frequently delivered as an incomplete set of base
+    forecasts: a period may come with values for the national total and only a
+    handful of stores, while the remaining series are simply not reported. Such
+    missing forecasts must **not** be read as a forecast of zero, so the usual
+    ``S @ P @ y_hat`` reconciliation, which assumes a value for every series in
+    every period, cannot be applied directly.
+
+    This reconciler processes each period ("date") independently:
+
+    1. Keep only the rows of ``S`` for which a base forecast was actually
+       delivered. Let ``S_a`` be that sub-matrix and ``y_a`` the delivered
+       forecasts.
+    2. Solve the least-squares problem implied by the hierarchy for the bottom
+       (leaf) values ``b``, starting from the delivered aggregate values:
+
+       ```math
+       \hat{\mathbf{b}} = \underset{\mathbf{b}}{\operatorname{argmin}}\;
+       \lVert \mathbf{y}_a - \mathbf{S}_a \mathbf{b} \rVert^2_2 .
+       ```
+
+       With a ridge term ``ridge > 0`` the problem is the penalised version
+       ``\lVert y_a - S_a b \rVert^2 + ridge \lVert b \rVert^2``, which is always
+       solvable and shrinks the leaves towards zero; this is only a numerical
+       stabiliser and does not change the notion of identifiability below.
+    3. Complete the full hierarchy with the summing matrix,
+       ``\tilde{\mathbf{y}} = \mathbf{S}\hat{\mathbf{b}}``, so every reported
+       period is coherent by construction.
+
+    A period is *publishable* when its delivered rows determine the leaf values
+    uniquely, i.e. when ``S_a`` has full column rank. If the delivered series are
+    rich enough (for example leaves plus a total) this holds and the reconciled
+    output is complete. If they are not (for example only a national total and a
+    few stores in a wide hierarchy) many leaf configurations reproduce the same
+    delivered values, and the leaf forecasts - and therefore the completed rows -
+    are not identified. Those periods are reported in ``unpublishable_dates`` and
+    their reconciled values are left missing (``NaN``) instead of being invented.
+
+    Args:
+        ridge (float): Non-negative ridge stabiliser added to the least-squares
+            normal equations of identified periods. ``0`` (default) solves the
+            plain least-squares problem. A positive value only affects numerical
+            conditioning; it does not make an otherwise unidentified period
+            publishable.
+        allow_unidentified (bool): If ``True`` (default), periods whose leaf
+            values are not identified are reported through
+            ``unpublishable_dates`` and left as ``NaN`` in the reconciled
+            output. If ``False``, such a period raises a ``ValueError`` instead.
+        rank_tol (float): Relative tolerance used to decide the numerical rank
+            of the delivered summing matrix. Default is ``1e-8``.
+
+    Attributes:
+        publishable_dates (list[int]): Column positions of the periods that were
+            reconciled in full.
+        unpublishable_dates (list[int]): Column positions of the periods whose
+            leaf values could not be determined from the delivered base
+            forecasts (and are therefore left as ``NaN``).
+        is_partial_method (bool): ``True``; signals that ``y_hat`` may contain
+            ``NaN`` entries for series without a delivered forecast.
+
+    Examples:
+        >>> # A hierarchy with a total, two regions and four leaves per region.
+        >>> rec = PartialMinTrace(allow_unidentified=True)
+        >>> rec.fit(S=S, y_hat=y_hat, tags=tags)
+        >>> rec.unpublishable_dates
+        [1]
+    """
+
+    is_strictly_hierarchical = False
+    # Missing forecasts are legitimate for this method, so the core must not
+    # reject NaN entries in `y_hat` and must densify the delivered rows.
+    is_partial_method = True
+
+    def __init__(
+        self,
+        ridge: float = 0.0,
+        allow_unidentified: bool = True,
+        rank_tol: float = 1e-8,
+    ):
+        if ridge < 0:
+            raise ValueError(f"`ridge` must be non-negative, got {ridge}.")
+        if rank_tol <= 0:
+            raise ValueError(f"`rank_tol` must be positive, got {rank_tol}.")
+        self.ridge = float(ridge)
+        self.allow_unidentified = bool(allow_unidentified)
+        self.rank_tol = float(rank_tol)
+        self.unpublishable_dates = []
+        self.publishable_dates = []
+        self._init_params = {
+            "ridge": ridge,
+            "allow_unidentified": allow_unidentified,
+        }
+        if rank_tol != 1e-8:
+            self._init_params["rank_tol"] = rank_tol
+
+    def _solve_period(self, S: np.ndarray, y_a: np.ndarray, idx_a: np.ndarray):
+        """Reconcile one period from its delivered forecasts.
+
+        Args:
+            S: Full summing matrix of size (`n_series`, `n_bottom`).
+            y_a: Delivered base forecasts for the rows in `idx_a`.
+            idx_a: Row indices of `S` with a delivered forecast.
+
+        Returns:
+            Tuple ``(y_tilde, identified)`` where `y_tilde` is the completed
+            coherent forecast of size (`n_series`,) (``NaN`` when not
+            identified) and `identified` says whether the leaf values are
+            uniquely determined.
+        """
+        S_a = S[idx_a]
+        n_bottom = S.shape[1]
+        # Identifiability depends only on which hierarchy rows were delivered:
+        # the leaf values are pinned down when `S_a` has full column rank. Use a
+        # relative singular-value tolerance so the test is scale invariant.
+        identified = False
+        if idx_a.size >= n_bottom:
+            singular = np.linalg.svd(S_a, compute_uv=False)
+            if singular.size and singular[0] > 0:
+                identified = singular[-1] > self.rank_tol * singular[0]
+        if not identified and not self.allow_unidentified:
+            raise ValueError(
+                "The delivered base forecasts do not determine the bottom-level "
+                "values for one period. Pass `allow_unidentified=True` to leave "
+                "those dates unpublished (as NaN) instead of raising."
+            )
+        if not identified:
+            return np.full(S.shape[0], np.nan), False
+        if self.ridge > 0:
+            # Ridge-augmented normal equations: (S_a' S_a + ridge I) b = S_a' y_a.
+            gram = S_a.T @ S_a + self.ridge * np.eye(n_bottom)
+        else:
+            gram = S_a.T @ S_a
+        rhs = S_a.T @ y_a
+        try:
+            b = np.linalg.solve(gram, rhs)
+        except np.linalg.LinAlgError:
+            # Numerical singularity: fall back to a least-squares solution.
+            b = np.linalg.lstsq(gram, rhs, rcond=None)[0]
+        return S @ b, True
+
+    def fit(
+        self,
+        S: np.ndarray,
+        y_hat: np.ndarray,
+        y_insample: np.ndarray | None = None,
+        y_hat_insample: np.ndarray | None = None,
+        sigmah: np.ndarray | None = None,
+        intervals_method: str | None = None,
+        num_samples: int | None = None,
+        seed: int | None = None,
+        tags: dict[str, np.ndarray] | None = None,
+    ):
+        """Partial Minimum Trace Fit Method.
+
+        Args:
+            S (np.ndarray): Summing matrix of size (`base`, `bottom`).
+            y_hat (np.ndarray): Forecast values of size (`base`, `horizon`).
+                Entries may be ``NaN`` when a series has no delivered forecast
+                for that horizon step.
+            y_insample (Optional[np.ndarray]): Unused; kept for API symmetry.
+            y_hat_insample (Optional[np.ndarray]): Unused; kept for API symmetry.
+            sigmah (Optional[np.ndarray]): Unused; kept for API symmetry.
+            intervals_method (Optional[str]): Unused; kept for API symmetry.
+            num_samples (Optional[int]): Unused; kept for API symmetry.
+            seed (Optional[int]): Unused; kept for API symmetry.
+            tags (Optional[dict[str, np.ndarray]]): Each key is a level and each
+                value its `S` indices. Unused; kept for API symmetry.
+
+        Returns:
+            PartialMinTrace: fitted reconciler.
+        """
+        if intervals_method is not None:
+            raise NotImplementedError(
+                "PartialMinTrace only reconciles point forecasts; prediction "
+                "intervals are not supported."
+            )
+        S = np.asarray(S, dtype=np.float64)
+        y_hat = np.asarray(y_hat, dtype=np.float64)
+        if S.ndim != 2:
+            raise ValueError(f"`S` must be two-dimensional, got shape {S.shape}.")
+        if y_hat.ndim != 2 or y_hat.shape[0] != S.shape[0]:
+            raise ValueError(
+                f"`y_hat` must have shape ({S.shape[0]}, horizon), got {y_hat.shape}."
+            )
+        self._y_hat = y_hat
+
+        self.publishable_dates = []
+        self.unpublishable_dates = []
+        reconciled = np.full_like(y_hat, np.nan)
+        for t in range(y_hat.shape[1]):
+            column = y_hat[:, t]
+            delivered = np.isfinite(column)
+            if not delivered.any():
+                # Nothing was delivered for this period; nothing to publish.
+                self.unpublishable_dates.append(t)
+                continue
+            idx_a = np.flatnonzero(delivered)
+            y_tilde, identified = self._solve_period(S, column[idx_a], idx_a)
+            reconciled[:, t] = y_tilde
+            if identified:
+                self.publishable_dates.append(t)
+            else:
+                self.unpublishable_dates.append(t)
+
+        self.y_hat = reconciled
+        self.P = None
+        self.W = None
+        self.sampler = None
+        self.fitted = True
+        return self
+
+    def fit_predict(
+        self,
+        S: np.ndarray,
+        y_hat: np.ndarray,
+        y_insample: np.ndarray | None = None,
+        y_hat_insample: np.ndarray | None = None,
+        sigmah: np.ndarray | None = None,
+        level: list[int] | None = None,
+        intervals_method: str | None = None,
+        num_samples: int | None = None,
+        seed: int | None = None,
+        tags: dict[str, np.ndarray] | None = None,
+    ):
+        """Partial Minimum Trace Reconciliation Method.
+
+        Args:
+            S (np.ndarray): Summing matrix of size (`base`, `bottom`).
+            y_hat (np.ndarray): Forecast values of size (`base`, `horizon`).
+                Entries may be ``NaN`` where no base forecast was delivered.
+            y_insample (Optional[np.ndarray]): Unused.
+            y_hat_insample (Optional[np.ndarray]): Unused.
+            sigmah (Optional[np.ndarray]): Unused.
+            level (Optional[list[int]]): Must be ``None``; intervals are not
+                supported.
+            intervals_method (Optional[str]): Unused.
+            num_samples (Optional[int]): Unused.
+            seed (Optional[int]): Unused.
+            tags (Optional[dict[str, np.ndarray]]): Unused.
+
+        Returns:
+            dict: ``{"mean": y_tilde}`` with the reconciled forecasts of size
+            (`base`, `horizon`); entries are ``NaN`` for unpublished dates.
+        """
+        if level is not None:
+            raise NotImplementedError(
+                "PartialMinTrace only reconciles point forecasts; prediction "
+                "intervals are not supported."
+            )
+        self.fit(
+            S=S,
+            y_hat=y_hat,
+            y_insample=y_insample,
+            y_hat_insample=y_hat_insample,
+            sigmah=sigmah,
+            intervals_method=intervals_method,
+            num_samples=num_samples,
+            seed=seed,
+            tags=tags,
+        )
+        return {"mean": self.y_hat}
+
+    __call__ = fit_predict
+
+
+def partial_reconcile(
+    S: np.ndarray,
+    y_hat: np.ndarray,
+    ridge: float = 0.0,
+    rank_tol: float = 1e-8,
+    allow_unidentified: bool = True,
+):
+    """Reconcile partially observed forecasts, one period at a time.
+
+    Convenience wrapper around :class:`PartialMinTrace` for a single hierarchy.
+    Each column of ``y_hat`` is reconciled from the rows that actually carry a
+    forecast; missing (``NaN`` or ``inf``) entries are never treated as zero.
+    Delivered periods whose leaf values are determined by the hierarchy are
+    completed coherently; the remaining periods are left as ``NaN``.
+
+    Args:
+        S: Summing matrix of size (`n_series`, `n_bottom`).
+        y_hat: Base forecasts of size (`n_series`, `n_horizon`), possibly with
+            missing entries.
+        ridge: Non-negative ridge stabiliser for the least-squares system.
+        rank_tol: Relative tolerance for the rank/identifiability test.
+        allow_unidentified: If ``True`` (default), leave periods whose leaf
+            values are not identified as ``NaN``. If ``False``, raise instead.
+
+    Returns:
+        dict with keys:
+
+        - ``mean``: reconciled forecasts, same shape as ``y_hat`` (``NaN`` for
+          unpublished periods).
+        - ``publishable_dates``: column indices that were fully reconciled.
+        - ``unpublishable_dates``: column indices whose leaves are not
+          identified (and, with ``allow_unidentified=True``, are left missing).
+    """
+    rec = PartialMinTrace(
+        ridge=ridge,
+        allow_unidentified=allow_unidentified,
+        rank_tol=rank_tol,
+    )
+    res = rec.fit_predict(S=S, y_hat=y_hat)
+    return {
+        "mean": res["mean"],
+        "publishable_dates": list(rec.publishable_dates),
+        "unpublishable_dates": list(rec.unpublishable_dates),
+    }
 
 
 class OptimalCombination(MinTrace):

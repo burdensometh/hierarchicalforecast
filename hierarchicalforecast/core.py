@@ -4,6 +4,7 @@ __all__ = ['HierarchicalReconciliation']
 import re
 import reprlib
 import time
+import warnings
 from inspect import signature
 
 import narwhals.stable.v2 as nw
@@ -257,8 +258,15 @@ class HierarchicalReconciliation:
         id_time_col: str = "temporal_id",
         temporal: bool = False,
         skip_identity_check: bool = False,
+        partial: bool = False,
     ) -> tuple[FrameT, FrameT, FrameT, list[str], str]:
-        """Performs preliminary wrangling and protections."""
+        """Performs preliminary wrangling and protections.
+
+        When `partial` is True, `Y_hat_nw` is allowed to omit `(id, time)`
+        rows (a series simply has no delivered forecast for that date). The
+        returned frame is densified to the full `S x time` grid, with omitted
+        values set to `NaN` rather than zero.
+        """
         Y_hat_nw_cols = Y_hat_nw.columns
         S_nw_cols = S_nw.columns
 
@@ -318,19 +326,56 @@ class HierarchicalReconciliation:
                     f"Check `S_df` columns, {reprlib.repr(id_col)} must be in `S_df` columns."
                 )
 
-        # Check if Y_hat_df has the right shape
-        if len(Y_hat_nw.group_by(id_col).agg(nw.len()).unique(subset="len")) != 1:
+        # Check if Y_hat_df has the right shape. Partial forecasts may deliver a
+        # different number of non-grid rows per series, which is handled below by
+        # densifying onto the full (series x timestamp) grid.
+        if (
+            not partial
+            and len(Y_hat_nw.group_by(id_col).agg(nw.len()).unique(subset="len")) != 1
+        ):
             raise ValueError(
-                "Check `Y_hat_df`, there are missing timestamps. All series should have the same number of predictions."
+                "Check `Y_hat_df`, there are missing timestamps. All series should have the same number of predictions. "
+                "Use a reconciler that supports partial forecasts (e.g. `PartialMinTrace`) to allow series without a forecast on some dates."
             )
 
         # -------------------------------- Match Y_hat/Y/S index order --------------------------------#
         # TODO: This is now a bit slow as we always sort.
         S_nw = S_nw.with_columns(**{f"{id_col}_id": np.arange(len(S_nw))})
 
-        Y_hat_nw = Y_hat_nw.join(S_nw[[id_col, f"{id_col}_id"]], on=id_col, how="left")
-        Y_hat_nw = Y_hat_nw.sort(by=[f"{id_col}_id", time_col])
-        Y_hat_nw = Y_hat_nw[Y_hat_nw_cols]
+        if partial:
+            # A partial delivery may omit a series entirely or individual dates.
+            # Series present in `Y_hat` must still belong to `S`, and repeated
+            # `(series, timestamp)` pairs are ambiguous.
+            S_ids = set(S_nw[id_col].unique().to_list())
+            Y_hat_ids = set(Y_hat_nw[id_col].unique().to_list())
+            unknown_ids = Y_hat_ids - S_ids
+            if unknown_ids:
+                raise ValueError(
+                    f"There are unique_ids in Y_hat_df that are not in S_df: {reprlib.repr(unknown_ids)}"
+                )
+            if Y_hat_nw.select([id_col, time_col]).is_duplicated().any():
+                raise ValueError(
+                    "Check `Y_hat_df`, there are repeated (unique_id, ds) pairs. "
+                    "Each series may have at most one forecast per timestamp."
+                )
+            model_cols = [
+                col for col in Y_hat_nw_cols if col not in [id_col, time_col]
+            ]
+            Y_hat_nw = self._densify_partial(
+                Y_hat_nw=Y_hat_nw,
+                S_nw=S_nw,
+                model_cols=model_cols,
+                id_col=id_col,
+                time_col=time_col,
+            )
+            Y_hat_nw = Y_hat_nw.sort(by=[f"{id_col}_id", time_col])
+            Y_hat_nw = Y_hat_nw[Y_hat_nw_cols]
+        else:
+            Y_hat_nw = Y_hat_nw.join(
+                S_nw[[id_col, f"{id_col}_id"]], on=id_col, how="left"
+            )
+            Y_hat_nw = Y_hat_nw.sort(by=[f"{id_col}_id", time_col])
+            Y_hat_nw = Y_hat_nw[Y_hat_nw_cols]
 
         if Y_nw is not None:
             Y_nw_cols = Y_nw.columns
@@ -376,7 +421,10 @@ class HierarchicalReconciliation:
                 raise ValueError(
                     f"Column `{model}` in `Y_hat_df` contains non-numeric values. Make sure no column in `Y_hat_df` contains non-numeric values."
                 )
-            if Y_hat_nw[model].is_null().any():
+            # With partial forecasts, missing values are represented as nulls
+            # after densification; they must not be treated as zero and are
+            # instead left for the partial reconciler to handle.
+            if not partial and Y_hat_nw[model].is_null().any():
                 raise ValueError(
                     f"Column `{model}` in `Y_hat_df` contains null values. Make sure no column in `Y_hat_df` contains null values."
                 )
@@ -457,6 +505,68 @@ class HierarchicalReconciliation:
         S_nw = S_nw.filter(nw.col(id_col).is_in(unique_ids))
 
         return Y_hat_nw, S_nw, Y_nw, model_names, id_col
+
+    def _densify_partial(
+        self,
+        Y_hat_nw: Frame,
+        S_nw: Frame,
+        model_cols: list[str],
+        id_col: str,
+        time_col: str,
+    ) -> Frame:
+        """Expand a partial `Y_hat` to the full (series x timestamp) grid.
+
+        Every `(series, timestamp)` combination in `S x timestamps` that has no
+        delivered forecast is created with a null value. Nulls must never be
+        read as zeros; the reconcilers that accept partial input treat them as
+        "no forecast" and decide per date whether the hierarchy can complete
+        them.
+
+        Args:
+            Y_hat_nw: Delivered base forecasts (columns `id_col`, `time_col`,
+                and the forecast columns `model_cols`).
+            S_nw: Summing-matrix frame with the `<id_col>_id` ordering helper.
+            model_cols: Forecast columns to carry through.
+            id_col: Series identifier column.
+            time_col: Timestamp column.
+
+        Returns:
+            Frame with one row per `(series, timestamp)` on the full grid,
+            sorted by the summing-matrix order and timestamp.
+        """
+        id_col_id = f"{id_col}_id"
+
+        # Series to keep: those in `S`, in summing-matrix order.
+        series_nw = (
+            S_nw.select([id_col, id_col_id])
+            .unique(subset=[id_col], keep="first")
+            .sort(by=id_col_id)
+        )
+        # Full timestamp grid, preserving the natural order of `ds`.
+        times_nw = Y_hat_nw.select(nw.col(time_col)).unique().sort(by=time_col)
+
+        # Cross product `series x timestamps` via a constant join key; this
+        # keeps the native dtypes (categorical ids, datetime timestamps).
+        key = "__partial_grid_key"
+        grid = series_nw.with_columns(nw.lit(1).alias(key)).join(
+            times_nw.with_columns(nw.lit(1).alias(key)), on=key, how="inner"
+        )
+        grid = grid.drop(key)
+
+        delivered = Y_hat_nw.select([id_col, time_col, *model_cols])
+        out = grid.join(delivered, on=[id_col, time_col], how="left")
+
+        # Ensure numeric forecast columns are floating point so that missing
+        # combinations are represented as NaN (null) rather than being dropped.
+        # Non-numeric columns are left untouched; `_prepare_fit` rejects them
+        # with a dedicated error message.
+        schema = out.collect_schema()
+        for col in model_cols:
+            if col in out.columns and schema[col].is_numeric():
+                out = out.with_columns(
+                    nw.col(col).cast(nw.Float64).fill_null(float("nan")).alias(col)
+                )
+        return out
 
     def _prepare_Y(
         self,
@@ -564,6 +674,14 @@ class HierarchicalReconciliation:
             - `negative_count_before/after`: Count of negative values before/after reconciliation
             - `is_coherent`: Whether reconciled forecasts satisfy aggregation constraints (Overall level only)
             - `coherence_max_violation`: Maximum coherence violation (Overall level only)
+
+            When the reconcilers accept partial forecasts (e.g. `PartialMinTrace`),
+            `Y_hat_df` may omit `(unique_id, ds)` rows and the output is expanded to
+            the full series-by-date grid. Omitted combinations are never treated as
+            zero. After the call, `self.publishable_dates` and
+            `self.unpublishable_dates` map each reconciled model to the dates that
+            could and could not be completed from the delivered values. Unpublishable
+            dates are returned as `NaN` so they can be withheld from publication.
         """
         # To Narwhals
         Y_hat_nw = nw.from_native(Y_hat_df)
@@ -589,6 +707,43 @@ class HierarchicalReconciliation:
         else:
             Y_nw = None
 
+        # Partial reconciliers (e.g. `PartialMinTrace`) accept series without a
+        # delivered forecast on some dates. Enable the densifying/NaN-tolerant
+        # path only in that case, preserving the strict behaviour otherwise.
+        partial = any(
+            getattr(reconciler, "is_partial_method", False)
+            for reconciler in self.reconcilers
+        )
+        if partial:
+            if temporal:
+                raise NotImplementedError(
+                    "Partial forecasts are not supported for temporal reconciliation."
+                )
+            if Y_nw is not None:
+                raise NotImplementedError(
+                    "Partial forecasts are not supported together with `Y_df`."
+                )
+            if intervals_method in ["bootstrap", "permbu", "conformal"]:
+                raise NotImplementedError(
+                    f"Partial forecasts are not supported for intervals_method=`{intervals_method}`."
+                )
+            if diagnostics:
+                raise NotImplementedError(
+                    "Coherence diagnostics are not supported for partial forecasts."
+                )
+            for reconciler in self.reconcilers:
+                if not getattr(reconciler, "is_partial_method", False):
+                    reconciler_name = _build_fn_name(reconciler)
+                    raise NotImplementedError(
+                        f"Cannot mix partial and non-partial reconcilers in one call; "
+                        f"`{reconciler_name}` requires a complete `Y_hat_df`. "
+                        "Reconcile partial forecasts on their own."
+                    )
+            if level is not None:
+                raise NotImplementedError(
+                    "Prediction intervals are not supported for partial forecasts."
+                )
+
         # Check input's validity and sort dataframes
         Y_hat_nw, S_nw, Y_nw, self.model_names, id_col = self._prepare_fit(
             Y_hat_nw=Y_hat_nw,
@@ -603,6 +758,7 @@ class HierarchicalReconciliation:
             id_time_col=id_time_col,
             temporal=temporal,
             skip_identity_check=self._s_matrix is not None,
+            partial=partial,
         )
 
         # Initialize reconciler arguments
@@ -701,6 +857,8 @@ class HierarchicalReconciliation:
         self.execution_times = {}
         self.level_names = {}
         self.sample_names = {}
+        self.publishable_dates = {}
+        self.unpublishable_dates = {}
         for reconciler in self.reconcilers:
             reconcile_fn_name = _build_fn_name(reconciler)
 
@@ -767,6 +925,29 @@ class HierarchicalReconciliation:
                 kwargs = {key: reconciler_args[key] for key in kwargs_ls}
 
                 fcsts_model = reconciler(**kwargs, level=level)
+
+                if partial:
+                    # Report which dates the reconciler could publish in full.
+                    times = (
+                        Y_hat_nw.select(nw.col(time_col))
+                        .unique()
+                        .sort(by=time_col)[time_col]
+                        .to_list()
+                    )
+                    self.publishable_dates[recmodel_name] = [
+                        times[t] for t in getattr(reconciler, "publishable_dates", [])
+                    ]
+                    self.unpublishable_dates[recmodel_name] = [
+                        times[t] for t in getattr(reconciler, "unpublishable_dates", [])
+                    ]
+                    if self.unpublishable_dates[recmodel_name]:
+                        warnings.warn(
+                            f"Reconciler `{recmodel_name}` could not publish "
+                            f"{len(self.unpublishable_dates[recmodel_name])} date(s) "
+                            "because the delivered base forecasts do not determine the "
+                            "leaf values. These dates are returned as NaN. See "
+                            "`HierarchicalReconciliation.unpublishable_dates`."
+                        )
 
                 # Validate reconciler state for sampling (fail fast before processing results)
                 if num_samples > 0 and level is not None:

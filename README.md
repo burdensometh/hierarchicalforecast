@@ -25,6 +25,7 @@ A vast number of time series datasets are organized into structures with differe
 * Alternative reconciliation methods:
     - `MiddleOut`: It anchors the base predictions in a middle level. The levels above the base predictions use the bottom-up approach, while the levels below use a top-down.
     - `MinTrace`: Minimizes the total forecast variance of the space of coherent forecasts, with the Minimum Trace reconciliation.
+    - `PartialMinTrace`: Reconciles partially delivered forecasts (for example only a national total and a few stores) with a per-date least-squares fit, leaving dates whose leaf values are not determined unpublished instead of treating missing forecasts as zero.
     - `ERM`: Optimizes the reconciliation matrix minimizing an L1 regularized objective.
 * Probabilistic coherent methods:
     - `Normality`: Uses MinTrace variance-covariance closed form matrix under a normality assumption.
