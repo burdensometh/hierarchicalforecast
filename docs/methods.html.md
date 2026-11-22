@@ -227,6 +227,20 @@ test_fail(
       show_root_heading: true
       show_source: true
 
+## 7. Constrained Reconciliation
+
+::: hierarchicalforecast.methods.ConstrainedReconciliation
+    handler: python
+    options:
+      docstring_style: google
+      members:
+        - fit
+        - predict
+        - fit_predict
+      heading_level: 3
+      show_root_heading: true
+      show_source: true
+
 ## References
 
 ### General Reconciliation

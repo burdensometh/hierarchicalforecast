@@ -1,5 +1,5 @@
 __all__ = ['BottomUp', 'BottomUpSparse', 'TopDown', 'TopDownSparse', 'MiddleOut', 'MiddleOutSparse', 'MinTrace', 'MinTraceSparse',
-           'OptimalCombination', 'ERM']
+           'OptimalCombination', 'ERM', 'ConstrainedReconciliation']
 
 
 import warnings
@@ -2198,5 +2198,210 @@ class ERM(HReconciler):
         return self._reconcile(
             S=S, P=self.P, y_hat=y_hat, level=level, sampler=self.sampler
         )
+
+    __call__ = fit_predict
+
+
+class ConstrainedReconciliation(HReconciler):
+    r"""Constrained Reconciliation Class.
+
+    Point forecast reconciliation with leaf-level equality constraints. Some
+    bottom-level (leaf) forecasts are pinned to known settled values (e.g.
+    actuals already closed for a store-month) while the remaining free leaves
+    are chosen to stay as close as possible to the input base forecasts. All
+    forecasts are then re-aggregated through the summing matrix so the output
+    remains coherent.
+
+    For each horizon :math:`h`, let :math:`\mathcal{F}_h` be the set of fixed
+    leaves with settled value :math:`s_{i,h}` and :math:`\mathcal{U}_h` the
+    remaining free leaves. The method solves the constrained least squares
+    problem
+
+    .. math::
+
+        \min_{\boldsymbol{\beta}_{h}} \;
+            \lVert \mathbf{S}\boldsymbol{\beta}_{h} - \hat{\mathbf{y}}_{h} \rVert_2^2
+        \quad \text{s.t.} \quad
+            \beta_{i,h} = s_{i,h} \;\; \forall i \in \mathcal{F}_h,
+
+    with closed-form solution for the free leaves
+
+    .. math::
+
+        \boldsymbol{\beta}_{\mathcal{U},h}
+            = (\mathbf{S}_{\mathcal{U}}^\top \mathbf{S}_{\mathcal{U}})^{-1}
+              \mathbf{S}_{\mathcal{U}}^\top
+              \left(\hat{\mathbf{y}}_{h}
+                    - \mathbf{S}_{\mathcal{F}}\mathbf{s}_{\mathcal{F},h}\right),
+
+    where :math:`\mathbf{S}_{\mathcal{U}}` and
+    :math:`\mathbf{S}_{\mathcal{F}}` are the columns of :math:`\mathbf{S}`
+    associated with the free and fixed leaves. The reconciled forecasts are
+    :math:`\tilde{\mathbf{y}}_h = \mathbf{S}\boldsymbol{\beta}_h`.
+
+    When no leaf is fixed the solution is the ordinary OLS reconciliation;
+    when every leaf is fixed the settled values are preserved exactly and
+    only re-aggregated to the upper levels.
+
+    Args:
+        None
+
+    Note:
+        Only point forecasts are supported. Prediction intervals and
+        probabilistic samples cannot incorporate the equality constraints.
+    """
+
+    insample = False
+    is_strictly_hierarchical = False
+
+    def __init__(self):
+        self._init_params = {}
+        # Cache of linear-map factors keyed by the fixed-leaf boolean mask,
+        # because masks often repeat across horizons.
+        self._factor_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self.fitted = False
+        self.S: np.ndarray | None = None
+        self.settled: np.ndarray | None = None
+
+    @staticmethod
+    def _check_settled(
+        settled: np.ndarray | None, n_bottom: int, horizon: int
+    ) -> None:
+        if settled is None:
+            raise ValueError(
+                "ConstrainedReconciliation requires `settled` values "
+                "(bottom x horizon array, NaN for unsettled leaves)."
+            )
+        if settled.shape != (n_bottom, horizon):
+            raise ValueError(
+                f"`settled` must have shape ({n_bottom}, {horizon}) matching "
+                f"the bottom-level forecasts, got {settled.shape}."
+            )
+        if not np.isfinite(np.nan_to_num(settled, nan=0.0)).all():
+            raise ValueError(
+                "`settled` contains non-finite values (inf). Settled values "
+                "must be finite; use NaN for leaves without a settled value."
+            )
+
+    def _get_free_factors(
+        self, S: np.ndarray, fixed_mask: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Precompute the factors needed for one particular fixed/free split.
+
+        Returns:
+            fixed_idx, free_idx: Bottom-level column indices of the fixed and
+                free leaves.
+            inv_free: ``(S_U^T S_U)^{-1}`` acting on the free leaves.
+            S_free: Columns of S corresponding to free leaves.
+        """
+        fixed_idx = np.flatnonzero(fixed_mask)
+        free_idx = np.flatnonzero(~fixed_mask)
+        if free_idx.size == 0:
+            return fixed_idx, free_idx, np.empty((0, 0)), np.empty((S.shape[0], 0))
+        S_free = S[:, free_idx]
+        gram = S_free.T @ S_free
+        # Every non-empty column submatrix of a summing matrix with identity
+        # bottom block has full column rank, hence the Gram matrix is SPD.
+        inv_free = np.linalg.inv(gram)
+        return fixed_idx, free_idx, inv_free, S_free
+
+    def fit(
+        self,
+        S: np.ndarray | sparse.spmatrix,
+        y_hat: np.ndarray,
+        settled: np.ndarray | None = None,
+        tags: dict[str, np.ndarray] | None = None,
+    ):
+        """Constrained Reconciliation Fit Method.
+
+        Args:
+            S (np.ndarray | sparse.spmatrix): Summing matrix of size
+                (`base`, `bottom`); sparse matrices are densified internally.
+            y_hat (np.ndarray): Base forecast values of size (`base`, `horizon`).
+            settled (np.ndarray): Bottom-level settled values of size
+                (`bottom`, `horizon`); NaN marks leaves without a settled value.
+            tags (Optional[dict[str, np.ndarray]], optional): Tags for the
+                hierarchical structure. Default is None.
+
+        Returns:
+            ConstrainedReconciliation (object): fitted reconciler.
+        """
+        if isinstance(S, sparse.spmatrix):
+            S = S.toarray()
+        S = np.asarray(S, dtype=np.float64)
+        n_hiers, n_bottom = S.shape
+        horizon = y_hat.shape[1]
+        self._check_settled(settled, n_bottom, horizon)
+        assert settled is not None  # guaranteed by _check_settled
+        self.S = S
+        self.y_hat = y_hat
+        self.settled = settled
+        # Projection matrix only exists for the unconstrained case; keep the
+        # attribute for API compatibility with the base reconciler.
+        self.P = BottomUp()._get_PW_matrices(S=S)[0]
+        self.W = np.eye(n_hiers, dtype=np.float64)
+        self.sampler = None
+        self.fitted = True
+        return self
+
+    def fit_predict(
+        self,
+        S: np.ndarray | sparse.spmatrix,
+        y_hat: np.ndarray,
+        settled: np.ndarray | None = None,
+        tags: dict[str, np.ndarray] | None = None,
+        level: list[int] | None = None,
+        **kwargs,
+    ) -> dict[str, np.ndarray]:
+        """Constrained Reconciliation Method.
+
+        Args:
+            S (np.ndarray | sparse.spmatrix): Summing matrix of size
+                (`base`, `bottom`); sparse matrices are densified internally.
+            y_hat (np.ndarray): Base forecast values of size (`base`, `horizon`).
+            settled (np.ndarray): Bottom-level settled values of size
+                (`bottom`, `horizon`); NaN marks leaves without a settled value.
+            tags (Optional[dict[str, np.ndarray]], optional): Tags for the
+                hierarchical structure. Default is None.
+            level (Optional[list[int]], optional): Must be None; probabilistic
+                intervals are not supported under leaf constraints.
+
+        Returns:
+            y_tilde (dict): Reconciliated forecasts under the leaf constraints.
+        """
+        if level is not None:
+            raise ValueError(
+                "ConstrainedReconciliation only supports point forecasts; "
+                "prediction intervals (`level`) are not available."
+            )
+        if isinstance(S, sparse.spmatrix):
+            S = S.toarray()
+        S = np.asarray(S, dtype=np.float64)
+        self.fit(S=S, y_hat=y_hat, settled=settled, tags=tags)
+        settled_values = self.settled
+        assert settled_values is not None
+
+        n_hiers, n_bottom = S.shape
+        horizon = y_hat.shape[1]
+        beta = np.full((n_bottom, horizon), np.nan, dtype=np.float64)
+
+        for h in range(horizon):
+            fixed_mask = ~np.isnan(settled_values[:, h])
+            mask_key = tuple(fixed_mask.tolist())
+            factors = self._factor_cache.get(mask_key)
+            if factors is None:
+                factors = self._get_free_factors(S, fixed_mask)
+                self._factor_cache[mask_key] = factors
+            fixed_idx, free_idx, inv_free, S_free = factors
+
+            if fixed_idx.size:
+                beta[fixed_idx, h] = settled_values[fixed_idx, h]
+
+            if free_idx.size:
+                residual = y_hat[:, h] - S[:, fixed_idx] @ settled_values[fixed_idx, h]
+                beta[free_idx, h] = inv_free @ (S_free.T @ residual)
+
+        mean = S @ beta
+        return {"mean": mean}
 
     __call__ = fit_predict

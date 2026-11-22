@@ -152,6 +152,120 @@ def _build_fn_name(fn) -> str:
     return fn_name
 
 
+def _prepare_settled(
+    settled_nw: Frame,
+    Y_hat_nw: Frame,
+    S_nw: Frame,
+    n_bottom: int,
+    id_col: str,
+    time_col: str,
+    target_col: str,
+    horizon: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate settled values and align them with the reconciliation layout.
+
+    Args:
+        settled_nw: Narwhals frame with settled values. Must contain
+            ``[id_col, time_col, target_col]`` columns.
+        Y_hat_nw: Sorted base-forecast frame (order matches ``S_nw``).
+        S_nw: Sorted summing-matrix frame; the last ``n_bottom`` rows are the
+            bottom-level series.
+        n_bottom: Number of bottom-level (leaf) series.
+        id_col: Column identifying each series.
+        time_col: Column identifying each timestamp.
+        target_col: Column containing the settled value.
+        horizon: Number of forecast timestamps per series.
+
+    Returns:
+        settled: Float array of shape (``n_bottom``, ``horizon``) with the
+            settled leaf values and NaN for unsettled leaves.
+        is_settled: Boolean array of length ``len(Y_hat_nw)`` flagging every
+            settled leaf row in the output table.
+    """
+    required_cols = [id_col, time_col, target_col]
+    missing_cols = set(required_cols) - set(settled_nw.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Check `settled_df` columns, {reprlib.repr(missing_cols)} must be "
+            f"in `settled_df` columns. Expected {reprlib.repr(required_cols)}."
+        )
+    extra_value_cols = [col for col in settled_nw.columns if col not in required_cols]
+    if extra_value_cols:
+        raise ValueError(
+            f"`settled_df` must contain only {reprlib.repr(required_cols)}; "
+            f"unexpected columns: {reprlib.repr(extra_value_cols)}."
+        )
+
+    if not settled_nw.schema[target_col].is_numeric():
+        raise ValueError(
+            f"Column `{target_col}` in `settled_df` contains non-numeric values."
+        )
+    if settled_nw[target_col].is_null().any():
+        raise ValueError(
+            f"Column `{target_col}` in `settled_df` contains null values."
+        )
+
+    # Timestamps outside the forecast horizon cannot be reconciled.
+    forecast_times = set(Y_hat_nw[time_col].unique().to_numpy().tolist())
+    unknown_times = sorted(
+        set(settled_nw[time_col].unique().to_numpy().tolist()) - forecast_times
+    )
+    if unknown_times:
+        raise ValueError(
+            f"`settled_df` contains timestamps not present in `Y_hat_df`: "
+            f"{reprlib.repr(unknown_times)}."
+        )
+
+    # Settled values are only meaningful at the leaf level. The bottom block of
+    # S is always the last n_bottom rows.
+    bottom_ids = S_nw[id_col].to_numpy()[-n_bottom:]
+    bottom_id_set = set(bottom_ids.tolist())
+    settled_ids = settled_nw[id_col].unique().to_numpy().tolist()
+    non_leaf_ids = sorted(set(settled_ids) - bottom_id_set)
+    if non_leaf_ids:
+        raise ValueError(
+            f"`settled_df` contains unique_ids that are not bottom-level "
+            f"(leaf) series: {reprlib.repr(non_leaf_ids)}. Settled values can "
+            f"only be pinned at the leaf level."
+        )
+    unknown_ids = sorted(
+        set(settled_ids) - set(Y_hat_nw[id_col].unique().to_numpy().tolist())
+    )
+    if unknown_ids:
+        raise ValueError(
+            f"`settled_df` contains unique_ids not present in `Y_hat_df`: "
+            f"{reprlib.repr(unknown_ids)}."
+        )
+
+    # Duplicate (series, timestamp) pairs would make the constraint ambiguous.
+    if len(settled_nw) != len(settled_nw.unique(subset=[id_col, time_col])):
+        dupes = (
+            settled_nw.group_by([id_col, time_col])
+            .agg(nw.len().alias("n"))
+            .filter(nw.col("n") > 1)
+        )
+        raise ValueError(
+            f"`settled_df` contains duplicated ({id_col}, {time_col}) pairs: "
+            f"{dupes.to_native().to_dict(orient='records')}."
+        )
+
+    # Left-join onto the sorted forecast grid so row order is guaranteed.
+    joined = Y_hat_nw[[id_col, time_col]].join(
+        settled_nw, on=[id_col, time_col], how="left"
+    )
+    settled_values = (
+        joined[target_col]
+        .fill_null(float("nan"))
+        .to_numpy()
+        .astype(np.float64, copy=False)
+    )
+    is_settled = ~np.isnan(settled_values)
+
+    n_series = len(S_nw)
+    settled_leaf = settled_values.reshape(n_series, horizon)[-n_bottom:, :]
+    return settled_leaf, is_settled
+
+
 def _estimate_sigmah(
     Y_hat_df: Frame,
     y_hat: np.ndarray,
@@ -242,6 +356,9 @@ class HierarchicalReconciliation:
 
     def __init__(self, reconcilers: list[HReconciler]):
         self.reconcilers = reconcilers
+        # Bottom-level settled values (n_bottom, horizon) when `settled_df` is
+        # provided to `reconcile`, otherwise None.
+        self.settled: np.ndarray | None = None
 
     def _prepare_fit(
         self,
@@ -507,6 +624,7 @@ class HierarchicalReconciliation:
         temporal: bool = False,
         diagnostics: bool = False,
         diagnostics_atol: float = 1e-6,
+        settled_df: Frame | None = None,
     ) -> FrameT:
         r"""Hierarchical Reconciliation Method.
 
@@ -552,6 +670,12 @@ class HierarchicalReconciliation:
             temporal (bool, optional): if True, perform temporal reconciliation. Default is False.
             diagnostics (bool, optional): if True, compute coherence diagnostics and store in `self.diagnostics`. Default is False.
             diagnostics_atol (float, optional): absolute tolerance for numerical coherence check. Default is 1e-6.
+            settled_df (Frame, optional): DataFrame with settled (already closed) leaf-level values, with
+                columns `[id_col, time_col, target_col]`. Each row pins the given bottom-level series at
+                the given timestamp to its settled value during reconciliation; the remaining free leaves
+                stay as close as possible to the base forecasts and all levels are re-aggregated
+                coherently. When provided, the output gains an `is_settled` boolean column marking the
+                settled leaf rows. Default is None.
 
         Returns:
             (FrameT): DataFrame, with reconciled predictions.
@@ -588,6 +712,22 @@ class HierarchicalReconciliation:
             Y_nw = nw.from_native(Y_df)
         else:
             Y_nw = None
+        if settled_df is not None:
+            settled_nw = nw.from_native(settled_df)
+        else:
+            settled_nw = None
+
+        # Settled values pin leaf-level point forecasts: incompatible with
+        # temporal reconciliation and probabilistic outputs.
+        if settled_nw is not None and temporal:
+            raise NotImplementedError(
+                "Settled values (`settled_df`) are not supported for temporal reconciliation."
+            )
+        if settled_nw is not None and level is not None:
+            raise NotImplementedError(
+                "Settled values (`settled_df`) are only supported for point forecasts; "
+                "prediction intervals (`level`) are not available."
+            )
 
         # Check input's validity and sort dataframes
         Y_hat_nw, S_nw, Y_nw, self.model_names, id_col = self._prepare_fit(
@@ -628,6 +768,26 @@ class HierarchicalReconciliation:
                 for key, val in tags.items()
             },
         )
+
+        # Align settled values with the sorted forecast grid. The bottom block
+        # of S is guaranteed to be the last n_bottom rows.
+        horizon = len(Y_hat_nw[time_col].unique().to_numpy())
+        is_settled_mask: np.ndarray | None = None
+        if settled_nw is not None:
+            settled_leaf, is_settled_mask = _prepare_settled(
+                settled_nw=settled_nw,
+                Y_hat_nw=Y_hat_nw,
+                S_nw=S_nw,
+                n_bottom=n_bottom,
+                id_col=id_col,
+                time_col=time_col,
+                target_col=target_col,
+                horizon=horizon,
+            )
+            reconciler_args["settled"] = settled_leaf
+            self.settled = settled_leaf
+        else:
+            self.settled = None
 
         any_sparse = any([method.is_sparse_method for method in self.reconcilers])
 
@@ -885,6 +1045,13 @@ class HierarchicalReconciliation:
             )
         else:
             self.diagnostics = None
+
+        if is_settled_mask is not None:
+            backend = nw.get_native_namespace(Y_tilde_nw)
+            marker = nw.from_dict(
+                {"is_settled": is_settled_mask.tolist()}, backend=backend
+            )["is_settled"]
+            Y_tilde_nw = Y_tilde_nw.with_columns(marker)
 
         Y_tilde_df = Y_tilde_nw.to_native()
 
