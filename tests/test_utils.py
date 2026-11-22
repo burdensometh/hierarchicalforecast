@@ -12,6 +12,7 @@ from hierarchicalforecast.utils import (
     _shrunk_covariance_schaferstrimmer_with_nans,
     aggregate,
     aggregate_temporal,
+    aggregate_temporal_calendar,
     get_cross_temporal_tags,
     level_to_outputs,
     make_future_dataframe,
@@ -653,3 +654,282 @@ def test_cov_equivalence():
 
     # Check equivalence of diagonal elements of shrunk W to non-shrunk W in case of no nans
     np.testing.assert_allclose(np.diag(W_np), np.diag(W_ss_nan), atol=1e-6)
+
+
+def _calendar_frames(backend="pandas"):
+    """Fiscal calendar with a regular week, a short week and a month-crossing week.
+
+    Business days are Mon-Fri. Week W02 has only four business days (short),
+    week W03 starts in January and ends in February (crosses a natural month).
+    """
+    days = []
+    for day in range(1, 6):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "2024-W01", "2024-M01"))
+    for day in range(8, 12):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "2024-W02", "2024-M01"))
+    for day in range(29, 32):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "2024-W03", "2024-M01"))
+    for day in range(1, 3):
+        days.append((pd.Timestamp(f"2024-02-{day:02d}"), "2024-W03", "2024-M02"))
+    calendar = pd.DataFrame(days, columns=["ds", "fiscal_week", "fiscal_month"])
+    if backend == "polars":
+        return pl.from_pandas(calendar), days
+    return calendar, days
+
+
+def _calendar_data(days, missing=(), backend="pandas"):
+    rows = []
+    for ds, _, _ in days:
+        if ds in missing:
+            continue
+        for unique_id in ("A", "B"):
+            rows.append({"unique_id": unique_id, "ds": ds, "y": float(ds.day)})
+    df = pd.DataFrame(rows)
+    if backend == "polars":
+        return pl.from_pandas(df)
+    return df
+
+
+@pytest.mark.parametrize("backend", ["pandas", "polars"])
+def test_aggregate_temporal_calendar_short_and_crossing_weeks(backend):
+    calendar, days = _calendar_frames(backend)
+    df = _calendar_data(days, backend=backend)
+    spec = {"week": "fiscal_week", "month": "fiscal_month"}
+
+    Y_df, S_df, tags, coverage = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec=spec
+    )
+    Y_df = Y_df.to_pandas() if backend == "polars" else Y_df
+    coverage = coverage.to_pandas() if backend == "polars" else coverage
+
+    # Every calendar group participates because all days are observed.
+    assert list(tags["month"]) == ["month//2024-M01", "month//2024-M02"]
+    assert list(tags["week"]) == ["week//2024-W01", "week//2024-W02", "week//2024-W03"]
+    # Bottom level is made of business days, labelled from the calendar.
+    assert tags["day"][0] == "day//2024-01-01"
+    assert len(tags["day"]) == len(days)
+
+    # Period identities are preserved from the calendar, not renumbered.
+    assert set(tags["week"]) == {"week//2024-W01", "week//2024-W02", "week//2024-W03"}
+    assert "month//2024-M02" in set(tags["month"])
+
+    # The short week is labelled short; the month-crossing week is complete.
+    week_cov = coverage[coverage["level"] == "week"].set_index("temporal_id")
+    assert week_cov.loc["week//2024-W02", "is_short"]
+    assert not week_cov.loc["week//2024-W01", "is_short"]
+    assert week_cov.loc["week//2024-W03", "status"] == "complete"
+    assert week_cov.loc["week//2024-W02", "status"] == "short"
+
+    # Aggregated values equal the sum of their member business days.
+    month_one = Y_df[(Y_df["temporal_id"] == "month//2024-M01") & (Y_df["unique_id"] == "A")]
+    jan_days = [d for d, _, m in days if m == "2024-M01"]
+    assert month_one["y"].iloc[0] == float(sum(d.day for d in jan_days))
+    # W03 spans two natural months but is a single fiscal week.
+    week_three = Y_df[(Y_df["temporal_id"] == "week//2024-W03") & (Y_df["unique_id"] == "A")]
+    assert week_three["y"].iloc[0] == float(29 + 30 + 31 + 1 + 2)
+
+    # The summing matrix aggregates each period over exactly its business days.
+    S_np = S_df.to_pandas() if backend == "polars" else S_df
+    S_values = S_np.set_index("temporal_id")
+    row_sum = S_values.sum(axis=1).to_dict()
+    assert row_sum["week//2024-W02"] == 4  # short week has four business days
+    assert row_sum["week//2024-W03"] == 5  # crossing week still has five
+
+
+@pytest.mark.parametrize("backend", ["pandas", "polars"])
+def test_aggregate_temporal_calendar_excludes_incomplete_periods(backend):
+    calendar, days = _calendar_frames(backend)
+    # Drop the last day of the short week for both series: the group is
+    # incomplete, so neither the week nor its month may participate.
+    missing = {pd.Timestamp("2024-01-11")}
+    df = _calendar_data(days, missing=missing, backend=backend)
+    spec = {"week": "fiscal_week", "month": "fiscal_month"}
+
+    Y_df, S_df, tags, coverage = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec=spec
+    )
+    coverage = coverage.to_pandas() if backend == "polars" else coverage
+
+    assert "week//2024-W02" not in set(tags["week"])
+    # W02 belongs to M01, so M01 must also drop out; M02 stays complete.
+    assert "month//2024-M01" not in set(tags["month"])
+    assert list(tags["month"]) == ["month//2024-M02"]
+
+    week_two = coverage[coverage["temporal_id"] == "week//2024-W02"].iloc[0]
+    assert not week_two["is_complete"]
+    assert not week_two["participates"]
+    assert week_two["status"] == "incomplete"
+    assert week_two["expected_days"] == 4
+    assert week_two["covered_days_min"] == 3
+
+    # The dropped day is not in the bottom level either.
+    assert "day//2024-01-11" not in set(tags["day"])
+    # No identifier from a dropped group leaks into Y.
+    Y_df = Y_df.to_pandas() if backend == "polars" else Y_df
+    assert "week//2024-W02" not in set(Y_df["temporal_id"])
+
+
+@pytest.mark.parametrize("backend", ["pandas", "polars"])
+def test_aggregate_temporal_calendar_partial_series_drops_group(backend):
+    calendar, days = _calendar_frames(backend)
+    rows = []
+    for ds, _, _ in days:
+        for unique_id in ("A", "B"):
+            # Series B never reports the first Tuesday of week W01.
+            if unique_id == "B" and ds == pd.Timestamp("2024-01-02"):
+                continue
+            rows.append({"unique_id": unique_id, "ds": ds, "y": float(ds.day)})
+    df = pd.DataFrame(rows)
+    df = pl.from_pandas(df) if backend == "polars" else df
+
+    _, _, tags, coverage = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec={"week": "fiscal_week", "month": "fiscal_month"}
+    )
+    coverage = coverage.to_pandas() if backend == "polars" else coverage
+
+    assert "week//2024-W01" not in set(tags["week"])
+    week_one = coverage[coverage["temporal_id"] == "week//2024-W01"].iloc[0]
+    assert week_one["n_series_covered"] == 1
+    assert week_one["covered_days_min"] == 4
+    assert week_one["covered_days_max"] == 5
+
+
+@pytest.mark.parametrize("backend", ["pandas", "polars"])
+def test_aggregate_temporal_calendar_sparse_matches_dense(backend):
+    calendar, days = _calendar_frames(backend)
+    df = _calendar_data(days, backend=backend)
+    spec = {"week": "fiscal_week", "month": "fiscal_month"}
+
+    Y_dense, S_dense, tags_dense, _ = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec=spec
+    )
+    Y_sparse, S_sparse, tags_sparse, _ = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec=spec, sparse_s=True
+    )
+
+    assert S_sparse.check_bottom_identity()
+    np.testing.assert_array_equal(
+        S_dense.drop(columns="temporal_id").values
+        if backend == "pandas"
+        else S_dense.drop("temporal_id").to_numpy(),
+        S_sparse.to_dense(),
+    )
+    for key in tags_dense:
+        np.testing.assert_array_equal(tags_dense[key], tags_sparse[key])
+
+
+def test_aggregate_temporal_calendar_validation():
+    calendar, days = _calendar_frames("pandas")
+    df = _calendar_data(days)
+
+    # Duplicate calendar timestamps are rejected.
+    duplicated = pd.concat([calendar, calendar.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match="one row per business day"):
+        aggregate_temporal_calendar(df=df, calendar=duplicated, spec={"week": "fiscal_week"})
+
+    # Data timestamps absent from the calendar are rejected.
+    extra = pd.concat(
+        [df, pd.DataFrame({"unique_id": ["A"], "ds": [pd.Timestamp("2024-03-01")], "y": [1.0]})],
+        ignore_index=True,
+    )
+    with pytest.raises(ValueError, match="absent from `calendar`"):
+        aggregate_temporal_calendar(df=extra, calendar=calendar, spec={"week": "fiscal_week"})
+
+    # A missing level column is reported.
+    with pytest.raises(ValueError, match="missing required columns"):
+        aggregate_temporal_calendar(df=df, calendar=calendar, spec={"week": "nope"})
+
+    # Using the time column as a level is rejected.
+    with pytest.raises(ValueError, match="cannot be used as a temporal level"):
+        aggregate_temporal_calendar(df=df, calendar=calendar, spec={"year": "ds"})
+
+    # A time format that collapses two business days onto one label is rejected.
+    intraday_calendar = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(["2024-01-01 08:00", "2024-01-01 20:00"]),
+            "fiscal_week": ["2024-W01", "2024-W01"],
+        }
+    )
+    intraday_df = pd.DataFrame(
+        {
+            "unique_id": ["A", "A"],
+            "ds": pd.to_datetime(["2024-01-01 08:00", "2024-01-01 20:00"]),
+            "y": [1.0, 2.0],
+        }
+    )
+    with pytest.raises(ValueError, match="duplicate business-day labels"):
+        aggregate_temporal_calendar(
+            df=intraday_df, calendar=intraday_calendar, spec={"week": "fiscal_week"}
+        )
+
+
+def test_aggregate_temporal_calendar_regular_period_uses_modal_length():
+    """A level whose first period is short is not treated as always short."""
+    # Week W00 has only one business day; the following weeks have three.
+    days = [(pd.Timestamp("2024-01-01"), "2024-W00", "2024-M01")]
+    for start in (2, 9, 16):
+        for offset in range(3):
+            days.append(
+                (pd.Timestamp("2024-01-01") + pd.Timedelta(days=start + offset - 1),
+                 "2024-W0" + str(start // 7 + 1), "2024-M01")
+            )
+    calendar = pd.DataFrame(days, columns=["ds", "fiscal_week", "fiscal_month"])
+    df = pd.DataFrame(
+        [
+            {"unique_id": unique_id, "ds": ds, "y": 1.0}
+            for ds, _, _ in days
+            for unique_id in ("A", "B")
+        ]
+    )
+    _, _, tags, coverage = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec={"week": "fiscal_week"}
+    )
+    coverage = coverage.set_index("temporal_id")
+    # One-day week is short relative to the modal three-day week.
+    assert coverage.loc["week//2024-W00", "is_short"]
+    # Full three-day weeks are not flagged short.
+    assert not coverage.loc["week//2024-W01", "is_short"]
+    assert set(tags["week"]) == {
+        "week//2024-W00",
+        "week//2024-W01",
+        "week//2024-W02",
+        "week//2024-W03",
+    }
+
+
+def test_aggregate_temporal_calendar_coverage_report_distinguishes_statuses():
+    """A short week (fully observed) differs from a week with missing days."""
+    days = []
+    # W01: five business days, fully observed -> complete
+    for day in range(1, 6):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "W01"))
+    # W02: four business days, fully observed -> short but complete
+    for day in range(8, 12):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "W02"))
+    # W03: five business days, one missing -> incomplete
+    for day in range(15, 20):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "W03"))
+    calendar = pd.DataFrame(days, columns=["ds", "fiscal_week"])
+    rows = [
+        {"unique_id": uid, "ds": ds, "y": 1.0}
+        for ds, _ in days
+        for uid in ("A", "B")
+        if ds != pd.Timestamp("2024-01-17")  # one missing day in W03
+    ]
+    df = pd.DataFrame(rows)
+
+    _, _, tags, coverage = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec={"week": "fiscal_week"}
+    )
+    coverage = coverage.set_index("temporal_id")
+
+    assert coverage.loc["week//W01", "status"] == "complete"
+    assert coverage.loc["week//W02", "status"] == "short"
+    assert coverage.loc["week//W03", "status"] == "incomplete"
+
+    # Only fully observed weeks enter the hierarchy.
+    assert set(tags["week"]) == {"week//W01", "week//W02"}
+    assert "week//W03" not in set(tags["week"])
+    # The short week is present and not confused with the incomplete one.
+    assert coverage.loc["week//W02", "participates"]
+    assert not coverage.loc["week//W03", "participates"]

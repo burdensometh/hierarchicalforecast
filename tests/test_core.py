@@ -23,7 +23,11 @@ from hierarchicalforecast.methods import (
     TopDown,
     TopDownSparse,
 )
-from hierarchicalforecast.utils import aggregate, aggregate_temporal
+from hierarchicalforecast.utils import (
+    aggregate,
+    aggregate_temporal,
+    aggregate_temporal_calendar,
+)
 
 
 @pytest.fixture(scope="module")
@@ -1397,3 +1401,104 @@ def test_smatrix_revalidates_bottom_identity_after_sparse_matrix_is_exposed():
     sparse_matrix.data[0] = 0.0
 
     assert not smat.check_bottom_identity()
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_calendar_temporal_reconciliation(lib):
+    """A fiscal-calendar hierarchy reconciles and stays coherent with short weeks."""
+    # Two fiscal weeks inside one fiscal month; the second week is short.
+    days = []
+    for day in range(1, 6):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "W01", "M01"))
+    for day in range(8, 11):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "W02", "M01"))
+    calendar = pd.DataFrame(days, columns=["ds", "fiscal_week", "fiscal_month"])
+    rows = [
+        {"unique_id": unique_id, "ds": ds, "y": float(ds.day)}
+        for ds, _, _ in days
+        for unique_id in ("A", "B")
+    ]
+    df = pd.DataFrame(rows)
+    if lib == "polars":
+        df = pl.from_pandas(df)
+        calendar = pl.from_pandas(calendar)
+    Y_df, S_df, tags, coverage = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec={"week": "fiscal_week", "month": "fiscal_month"}
+    )
+    Y_hat_df = Y_df.rename({"y": "y_model"}) if lib == "polars" else Y_df.rename(
+        columns={"y": "y_model"}
+    )
+
+    hrec = HierarchicalReconciliation([BottomUp(), MinTrace(method="ols")])
+    result = hrec.reconcile(
+        Y_hat_df=Y_hat_df, S_df=S_df, tags=tags, temporal=True
+    )
+    result_pd = result.to_pandas() if lib == "polars" else result
+
+    # Every reconciled value is present for each participating period.
+    assert "y_model/BottomUp" in result_pd.columns
+    assert "y_model/MinTrace_method-ols" in result_pd.columns
+    # Bottom-up keeps the month equal to the sum of its weeks, even though one
+    # week has fewer business days.
+    for model in ("y_model/BottomUp", "y_model/MinTrace_method-ols"):
+        by_period = result_pd.groupby("temporal_id")[model].sum()
+        month = by_period["month//M01"]
+        weeks = by_period["week//W01"] + by_period["week//W02"]
+        assert np.isclose(month, weeks)
+
+    # The short week is still reported as a calendar period, not renumbered.
+    assert "week//W02" in set(result_pd["temporal_id"])
+    coverage_pd = coverage.to_pandas() if lib == "polars" else coverage
+    short_week = coverage_pd[coverage_pd["temporal_id"] == "week//W02"].iloc[0]
+    assert short_week["is_short"]
+    assert short_week["participates"]
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_calendar_temporal_reconciliation_sparse(lib):
+    """Sparse SMatrix from aggregate_temporal_calendar reconciles like the dense one."""
+    days = []
+    for day in range(1, 6):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "W01", "M01"))
+    for day in range(8, 11):
+        days.append((pd.Timestamp(f"2024-01-{day:02d}"), "W02", "M01"))
+    calendar = pd.DataFrame(days, columns=["ds", "fiscal_week", "fiscal_month"])
+    df = pd.DataFrame(
+        [
+            {"unique_id": unique_id, "ds": ds, "y": float(ds.day)}
+            for ds, _, _ in days
+            for unique_id in ("A", "B")
+        ]
+    )
+    if lib == "polars":
+        df = pl.from_pandas(df)
+        calendar = pl.from_pandas(calendar)
+
+    Y_dense, S_dense, tags_dense, _ = aggregate_temporal_calendar(
+        df=df, calendar=calendar, spec={"week": "fiscal_week", "month": "fiscal_month"}
+    )
+    Y_sparse, S_sparse, tags_sparse, _ = aggregate_temporal_calendar(
+        df=df,
+        calendar=calendar,
+        spec={"week": "fiscal_week", "month": "fiscal_month"},
+        sparse_s=True,
+    )
+
+    def to_hat(Y):
+        return Y.rename({"y": "y_model"}) if lib == "polars" else Y.rename(
+            columns={"y": "y_model"}
+        )
+
+    hrec = HierarchicalReconciliation([BottomUp()])
+    rec_dense = hrec.reconcile(
+        Y_hat_df=to_hat(Y_dense), S_df=S_dense, tags=tags_dense, temporal=True
+    )
+    rec_sparse = hrec.reconcile(
+        Y_hat_df=to_hat(Y_sparse), S_df=S_sparse, tags=tags_sparse, temporal=True
+    )
+    rec_dense = rec_dense.to_pandas() if lib == "polars" else rec_dense
+    rec_sparse = rec_sparse.to_pandas() if lib == "polars" else rec_sparse
+    np.testing.assert_allclose(
+        rec_dense["y_model/BottomUp"].to_numpy(),
+        rec_sparse["y_model/BottomUp"].to_numpy(),
+    )

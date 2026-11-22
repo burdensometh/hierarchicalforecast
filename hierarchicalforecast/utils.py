@@ -1,4 +1,4 @@
-__all__ = ['aggregate', 'aggregate_temporal', 'make_future_dataframe', 'get_cross_temporal_tags', 'HierarchicalPlot', 'set_num_threads', 'get_num_threads', 'SMatrix']
+__all__ = ['aggregate', 'aggregate_temporal', 'aggregate_temporal_calendar', 'make_future_dataframe', 'get_cross_temporal_tags', 'HierarchicalPlot', 'set_num_threads', 'get_num_threads', 'SMatrix']
 
 
 import itertools
@@ -501,6 +501,551 @@ def aggregate_temporal(
     Y_df = Y_nw.to_native()
 
     return Y_df, S_df, tags
+
+
+def _py_scalar(value):
+    """Convert numpy / pandas scalars to plain Python objects.
+
+    Used when rebuilding a frame in a different dataframe backend, where
+    ``pandas.Timestamp`` objects would require pyarrow to cross into polars.
+    """
+    if hasattr(value, "to_pydatetime"):
+        return value.to_pydatetime()
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return value.item()
+        except (ValueError, AttributeError):
+            return value
+    if hasattr(value, "to_pylist"):
+        return value.to_pylist()
+    return value
+
+
+def _calendar_to_backend(frame_nw, backend):
+    """Return ``frame_nw`` using ``backend``, converting through Python values."""
+    if frame_nw.implementation == backend:
+        return frame_nw
+    data = frame_nw.to_dict(as_series=False)
+    data = {
+        key: [_py_scalar(value) for value in values]
+        for key, values in data.items()
+    }
+    return nw.from_dict(data, backend=backend)
+
+
+def _calendar_label_expr(column: str, schema, time_fmt: str):
+    """Build a string label expression for a calendar column.
+
+    Temporal columns are formatted with ``time_fmt``; string and numeric
+    columns are cast so the label round-trips the value the caller supplied.
+    """
+    expr = nw.col(column)
+    dtype = schema[column]
+    if dtype.is_temporal():
+        return expr.dt.to_string(time_fmt)
+    return expr.cast(nw.String)
+
+
+def _regular_period_length(expected: list[int]) -> int:
+    """Return the habitual number of business days for a level.
+
+    The modal length is used (ties resolved to the larger value), so periods
+    that are shorter than usual can be flagged as short without depending on
+    the calendar's first/last period being complete.
+    """
+    counts: dict[int, int] = {}
+    for value in expected:
+        counts[int(value)] = counts.get(int(value), 0) + 1
+    best = max(counts.values())
+    return max(length for length, count in counts.items() if count == best)
+
+
+def aggregate_temporal_calendar(
+    df: Frame,
+    calendar: Frame,
+    spec: dict[str, str],
+    id_col: str = "unique_id",
+    time_col: str = "ds",
+    id_time_col: str = "temporal_id",
+    target_cols: Sequence[str] = ("y",),
+    sparse_s: bool = False,
+    bottom_level: str = "day",
+    level_sep: str = "//",
+    time_fmt: str = "%Y-%m-%d",
+) -> tuple[FrameT, "FrameT | SMatrix", dict[str, np.ndarray], FrameT]:
+    """Build a temporal hierarchy from an explicit fiscal/business calendar.
+
+    Unlike :func:`aggregate_temporal`, which derives temporal levels from a
+    fixed number of bottom-level timesteps per period, this function takes the
+    period assignment of every business day from ``calendar``. That makes it
+    possible to model real fiscal calendars where weeks and fiscal months have
+    an irregular number of business days, where the first/last week is short,
+    and where a fiscal week spans two natural months.
+
+    Each series is aggregated to every level in ``spec`` and to the
+    bottom-level business day. A group (a fiscal week, a fiscal month, or a
+    business day) only participates in the hierarchy when **every** series
+    covers **all** of the business days the calendar assigns to it. Groups
+    with missing data are dropped, so the resulting summing matrix is coherent
+    and can be used with ``HierarchicalReconciliation.reconcile(temporal=True)``.
+
+    The fiscal period labels supplied by ``calendar`` are preserved verbatim in
+    ``id_time_col`` as ``"<level><level_sep><label>"``; periods are never
+    renumbered. A coverage report is returned alongside the hierarchy so
+    downstream reports can tell a *short* period (fewer business days than
+    usual, fully observed) from an *incomplete* period (some business day is
+    missing for at least one series).
+
+    Args:
+        df (Frame): Daily data with columns ``[id_col, time_col, *target_cols]``.
+            Rows sharing ``(id_col, time_col)`` are summed.
+        calendar (Frame): Business-day calendar with one row per business day.
+            It must contain ``time_col`` (unique) and one column per entry in
+            ``spec`` giving the period that the day belongs to.
+        spec (dict[str, str]): Mapping of level name to the ``calendar`` column
+            that holds its period label, e.g.
+            ``{"week": "fiscal_week", "month": "fiscal_month"}``. The level
+            order in the hierarchy is derived from the observed period length
+            (coarsest first); ties follow the order in ``spec``.
+        id_col (str, optional): Column that identifies each series. Default is
+            "unique_id".
+        time_col (str, optional): Column that identifies each business day.
+            Default is "ds".
+        id_time_col (str, optional): Name of the output period identifier
+            column. Default is "temporal_id".
+        target_cols (Sequence[str], optional): Target columns to aggregate.
+            Default is ``("y",)``.
+        sparse_s (bool, optional): Return ``S_df`` as an :class:`SMatrix`
+            instead of a dense DataFrame. Default is False.
+        bottom_level (str, optional): Name given to the bottom (business day)
+            level. Default is "day".
+        level_sep (str, optional): Separator between the level name and the
+            calendar label in ``id_time_col``. Default is "//".
+        time_fmt (str, optional): ``strftime`` format used to label business
+            days and any temporal calendar column. Default is "%Y-%m-%d".
+
+    Returns:
+        tuple[FrameT, FrameT | SMatrix, dict[str, np.ndarray], FrameT]:
+            Y_df, S_df, tags, coverage
+                Y_df: Temporally aggregated series for the participating
+                    groups, with columns ``[id_time_col, id_col, time_col,
+                    *target_cols]``. The ``time_col`` of an aggregated row is
+                    the last business day of its period.
+                S_df: Temporal summing matrix (dense DataFrame or
+                    :class:`SMatrix`).
+                tags: Mapping of level name to the participating
+                    ``id_time_col`` identifiers, coarsest level first and
+                    bottom level last.
+                coverage: One row per calendar group (levels and business
+                    days) describing how much of the period was observed.
+    """
+    target_cols = list(target_cols)
+    if not spec:
+        raise ValueError("`spec` must define at least one temporal level.")
+    if len(set(spec)) != len(spec):
+        raise ValueError("`spec` level names must be unique.")
+    if len(set(spec.values())) != len(spec.values()):
+        raise ValueError("`spec` must reference distinct calendar columns.")
+    if bottom_level in spec or bottom_level in spec.values():
+        raise ValueError(
+            f"The bottom level name {bottom_level!r} clashes with a level in `spec`."
+        )
+    if time_col in spec.values():
+        raise ValueError(
+            f"The calendar column {time_col!r} cannot be used as a temporal level."
+        )
+
+    df = ufv.ensure_time_dtype(df=df, time_col=time_col)
+    df = ufp.ensure_sorted(df=df, id_col=id_col, time_col=time_col)
+    calendar = ufv.ensure_time_dtype(df=calendar, time_col=time_col)
+
+    df_nw = nw.from_native(df)
+    backend = df_nw.implementation
+    cal_nw = _calendar_to_backend(nw.from_native(calendar), backend)
+
+    required = [time_col, *spec.values()]
+    missing = set(required) - set(cal_nw.columns)
+    if missing:
+        raise ValueError(
+            f"`calendar` is missing required columns: {reprlib.repr(missing)}"
+        )
+    for column in required:
+        if cal_nw[column].is_null().any():
+            raise ValueError(
+                f"Column {column!r} contains null values in `calendar`."
+            )
+    if cal_nw.select(time_col).unique().shape[0] != len(cal_nw):
+        raise ValueError(
+            f"Column {time_col!r} in `calendar` must contain one row per business day."
+        )
+    if len(cal_nw) == 0:
+        raise ValueError("`calendar` contains no business days.")
+    if id_time_col in df_nw.columns:
+        raise ValueError(
+            f"Column {id_time_col!r} already exists in `df`; choose another `id_time_col`."
+        )
+
+    # Align time dtype so the calendar join is exact, then order by time.
+    cal_nw = cal_nw.with_columns(nw.col(time_col).cast(df_nw.schema[time_col]))
+    cal_nw = cal_nw.sort(by=[time_col])
+
+    # Per-day strings, shared by the aggregated and bottom-level identifiers.
+    cal_nw = cal_nw.with_columns(
+        _calendar_label_expr(time_col, cal_nw.schema, time_fmt).alias("__day_label")
+    )
+    day_label_by_name = {
+        column: _calendar_label_expr(column, cal_nw.schema, time_fmt)
+        for column in spec.values()
+    }
+    cal_nw = cal_nw.with_columns(
+        *[
+            day_label_by_name[column].alias(f"__label_{column}")
+            for column in spec.values()
+        ]
+    )
+
+    day_order = cal_nw[time_col].to_list()
+    cal_records = cal_nw.select(
+        [time_col, "__day_label", *[f"__label_{c}" for c in spec.values()]]
+    ).to_dict(as_series=False)
+
+    # Unique labels keep the bottom block an identity matrix; a coarse
+    # `time_fmt` on a finer time column could otherwise collapse two days.
+    day_labels = [str(label) for label in cal_records["__day_label"]]
+    if len(set(day_labels)) != len(day_labels):
+        raise ValueError(
+            f"`time_fmt`={time_fmt!r} produces duplicate business-day labels; "
+            "choose a format that distinguishes every day in `calendar`."
+        )
+
+    # bottom-level identifier for every calendar day
+    bottom_by_day = {
+        day: f"{bottom_level}{level_sep}{day_labels[i]}"
+        for i, day in enumerate(day_order)
+    }
+
+    # ------------------------------------------------------- period metadata
+    levels: dict[str, dict] = {}
+    for name, column in spec.items():
+        label_column = f"__label_{column}"
+        per = cal_nw.group_by(column).agg(
+            nw.col(time_col).min().alias("__first"),
+            nw.col(time_col).max().alias("__last"),
+            nw.len().alias("__expected"),
+            nw.col(label_column).first().alias("__label"),
+        )
+        per = per.sort(by=["__first"])
+        per = per.with_columns(
+            nw.concat_str(
+                [nw.lit(f"{name}{level_sep}"), nw.col("__label")]
+            ).alias(id_time_col)
+        )
+        levels[name] = {
+            "column": column,
+            "frame": per,
+            "expected": [int(v) for v in per["__expected"].to_list()],
+            "temporal_ids": [str(v) for v in per[id_time_col].to_list()],
+            "periods": per[column].to_list(),
+            "regular": _regular_period_length(
+                [int(v) for v in per["__expected"].to_list()]
+            ),
+        }
+
+    # Coarsest (largest) periods first; ties keep the `spec` order.
+    level_order = sorted(
+        spec, key=lambda name: -float(np.mean(levels[name]["expected"]))
+    )
+
+    # --------------------------------------------------------- attach periods
+    dfj = df_nw.join(
+        cal_nw.select([time_col, *spec.values()]), on=time_col, how="left"
+    )
+    unmatched = dfj.filter(nw.col(spec[level_order[0]]).is_null())
+    if len(unmatched) > 0:
+        bad = unmatched.select(time_col).unique().head(5)[time_col].to_list()
+        raise ValueError(
+            f"`df` contains {time_col} values absent from `calendar`: "
+            f"{reprlib.repr(bad)}"
+        )
+
+    n_series = df_nw.select(id_col).unique().shape[0]
+    if n_series == 0:
+        raise ValueError("`df` contains no series.")
+
+    sums = [nw.col(target).sum().alias(target) for target in target_cols]
+
+    # ------------------------------------------------------------- coverage
+    # For each level, a period participates only when every series covers all
+    # the business days the calendar assigns to it.
+    participating: dict[str, list[str]] = {}
+    coverage_rows: list[dict] = []
+    coverage_columns: list[str] = []
+    for name in level_order:
+        info = levels[name]
+        column = info["column"]
+
+        cells = dfj.group_by([id_col, column]).agg(
+            nw.col(time_col).n_unique().alias("__covered")
+        )
+        cells = cells.join(
+            info["frame"].select(
+                [column, id_time_col, "__expected", "__first", "__last"]
+            ),
+            on=column,
+            how="left",
+        )
+        cells = cells.with_columns(
+            (nw.col("__covered") == nw.col("__expected")).alias("__ok")
+        )
+        # Simple aggregations only (pandas cannot vectorise n_unique in a
+        # group-by): one row per present (series, period), then count rows.
+        present = cells.group_by(column).agg(
+            nw.len().alias("__n_present"),
+            nw.col("__covered").min().alias("__covered_min"),
+            nw.col("__covered").max().alias("__covered_max"),
+        )
+        complete_counts = (
+            cells.filter(nw.col("__ok"))
+            .group_by(column)
+            .agg(nw.len().alias("__n_complete"))
+        )
+        stats_frame = present.join(complete_counts, on=column, how="left")
+        stats_frame = stats_frame.with_columns(
+            nw.col("__n_complete").fill_null(0).cast(nw.Int64)
+        )
+        stats_frame = stats_frame.with_columns(
+            *[nw.col(c).cast(nw.Int64) for c in
+              ("__n_present", "__covered_min", "__covered_max")]
+        )
+        stats_records = stats_frame.to_dict(as_series=False)
+        stats = {
+            stats_records[column][i]: {
+                "n_present": int(stats_records["__n_present"][i]),
+                "n_complete": int(stats_records["__n_complete"][i]),
+                "covered_min": int(stats_records["__covered_min"][i]),
+                "covered_max": int(stats_records["__covered_max"][i]),
+            }
+            for i in range(len(stats_records[column]))
+        }
+
+        meta = info["frame"].select(
+            [column, id_time_col, "__expected", "__first", "__last"]
+        )
+        meta_records = meta.to_dict(as_series=False)
+        meta_by_period = {
+            meta_records[column][i]: (
+                meta_records[id_time_col][i],
+                int(meta_records["__expected"][i]),
+                meta_records["__first"][i],
+                meta_records["__last"][i],
+            )
+            for i in range(len(meta_records[column]))
+        }
+
+        active: list[str] = []
+        for period in info["periods"]:
+            temporal_id, expected, first_ds, last_ds = meta_by_period[period]
+            period_stats = stats.get(
+                period,
+                {"n_present": 0, "n_complete": 0, "covered_min": 0, "covered_max": 0},
+            )
+            n_present = period_stats["n_present"]
+            n_complete = period_stats["n_complete"]
+            complete = n_complete == n_series
+            is_short = expected < info["regular"]
+            if complete:
+                active.append(str(temporal_id))
+            row = {
+                "level": name,
+                "period": str(temporal_id)[len(name) + len(level_sep):],
+                id_time_col: str(temporal_id),
+                "expected_days": expected,
+                "first_ds": first_ds,
+                "last_ds": last_ds,
+                "n_series": n_series,
+                "n_series_covered": n_complete,
+                "covered_days_min": period_stats["covered_min"],
+                "covered_days_max": period_stats["covered_max"],
+                "is_short": bool(is_short),
+                "is_complete": bool(complete),
+                "participates": bool(complete),
+                "status": (
+                    "incomplete"
+                    if not complete
+                    else ("short" if is_short else "complete")
+                ),
+            }
+            if not coverage_columns:
+                coverage_columns = list(row)
+            coverage_rows.append(row)
+        participating[name] = active
+
+    # -------------------------------------------------------- bottom coverage
+    day_totals = dfj.group_by([id_col, time_col]).agg(*sums)
+    day_counts = day_totals.group_by(time_col).agg(
+        nw.col(id_col).n_unique().alias("__n_present")
+    )
+    day_counts_records = day_counts.to_dict(as_series=False)
+    day_present = {
+        day: int(day_counts_records["__n_present"][i])
+        for i, day in enumerate(day_counts_records[time_col])
+    }
+    bottom_days = {
+        day for day, n_present in day_present.items() if n_present == n_series
+    }
+    bottom_ids = [
+        bottom_by_day[day] for day in day_order if day in bottom_days
+    ]
+    participating[bottom_level] = bottom_ids
+
+    for day in day_order:
+        n_present = day_present.get(day, 0)
+        complete = day in bottom_days
+        coverage_rows.append(
+            {
+                "level": bottom_level,
+                "period": bottom_by_day[day][len(bottom_level) + len(level_sep):],
+                id_time_col: bottom_by_day[day],
+                "expected_days": 1,
+                "first_ds": day,
+                "last_ds": day,
+                "n_series": n_series,
+                "n_series_covered": n_present,
+                "covered_days_min": 1 if n_present > 0 else 0,
+                "covered_days_max": 1 if n_present > 0 else 0,
+                "is_short": False,
+                "is_complete": bool(complete),
+                "participates": bool(complete),
+                "status": "complete" if complete else "incomplete",
+            }
+        )
+
+    # ----------------------------------------------------------- build Y_df
+    frames = []
+    for name in level_order:
+        info = levels[name]
+        column = info["column"]
+        active = participating[name]
+        if not active:
+            continue
+        level_df = dfj.group_by([id_col, column]).agg(*sums)
+        level_df = level_df.join(
+            info["frame"].select([column, id_time_col, "__last"]),
+            on=column,
+            how="left",
+        )
+        level_df = level_df.filter(nw.col(id_time_col).is_in(active))
+        level_df = level_df.rename({"__last": time_col})
+        level_df = level_df.select([id_time_col, id_col, time_col, *target_cols])
+        frames.append(level_df)
+
+    if bottom_ids:
+        bottom_df = day_totals.filter(nw.col(time_col).is_in(list(bottom_days)))
+        bottom_df = bottom_df.with_columns(
+            nw.concat_str(
+                [
+                    nw.lit(f"{bottom_level}{level_sep}"),
+                    _calendar_label_expr(time_col, bottom_df.schema, time_fmt),
+                ]
+            ).alias(id_time_col)
+        )
+        bottom_df = bottom_df.select([id_time_col, id_col, time_col, *target_cols])
+        frames.append(bottom_df)
+
+    if frames:
+        Y_nw = nw.concat(frames, how="vertical").sort(by=[id_col, time_col])
+    else:
+        Y_nw = nw.from_dict(
+            {
+                id_time_col: [],
+                id_col: [],
+                time_col: [],
+                **{target: [] for target in target_cols},
+            },
+            backend=backend,
+        )
+    Y_nw = nw.maybe_reset_index(Y_nw)
+
+    # ------------------------------------------------------------- build S
+    # Membership of a period is read straight from the calendar: a business
+    # day belongs to the period its calendar row assigns to it.
+    membership: dict[str, set[str]] = {}
+    for column in spec.values():
+        for i, day in enumerate(day_order):
+            period = cal_records[f"__label_{column}"][i]
+            membership.setdefault(f"{column}::{period}", set()).add(
+                bottom_by_day[day]
+            )
+
+    row_ids: list[str] = []
+    row_members: list[set[str]] = []
+    tags: dict[str, np.ndarray] = {}
+    for name in level_order:
+        info = levels[name]
+        active_set = set(participating[name])
+        level_ids: list[str] = []
+        meta_records = info["frame"].select([info["column"], id_time_col]).to_dict(
+            as_series=False
+        )
+        for i in range(len(meta_records[info["column"]])):
+            temporal_id = str(meta_records[id_time_col][i])
+            if temporal_id not in active_set:
+                continue
+            period = meta_records[info["column"]][i]
+            key = f"{info['column']}::{period}"
+            row_ids.append(temporal_id)
+            row_members.append(membership.get(key, set()))
+            level_ids.append(temporal_id)
+        tags[name] = np.asarray(level_ids, dtype=object)
+
+    row_ids.extend(bottom_ids)
+    for bottom_id in bottom_ids:
+        row_members.append({bottom_id})
+    tags[bottom_level] = np.asarray(bottom_ids, dtype=object)
+
+    n_rows = len(row_ids)
+    n_bottom = len(bottom_ids)
+    bottom_position = {bottom_id: j for j, bottom_id in enumerate(bottom_ids)}
+    matrix = np.zeros((n_rows, n_bottom), dtype=np.float64)
+    for i, members in enumerate(row_members):
+        for member in members:
+            position = bottom_position.get(member)
+            if position is not None:
+                matrix[i, position] = 1.0
+
+    if sparse_s:
+        S_df = SMatrix(
+            sparse_matrix=sparse.csr_matrix(matrix),
+            row_labels=np.asarray(row_ids, dtype=object),
+            col_labels=np.asarray(bottom_ids, dtype=object),
+            id_col=id_time_col,
+            backend=backend,
+        )
+        S_df._bottom_identity_verified = True
+    else:
+        S_nw = nw.from_dict(
+            {
+                id_time_col: row_ids,
+                **{
+                    bottom_id: matrix[:, j]
+                    for j, bottom_id in enumerate(bottom_ids)
+                },
+            },
+            backend=backend,
+        )
+        S_df = nw.maybe_reset_index(S_nw).to_native()
+
+    coverage = nw.maybe_reset_index(
+        nw.from_dict(
+            {
+                column: [row[column] for row in coverage_rows]
+                for column in coverage_columns
+            },
+            backend=backend,
+        )
+    ).to_native()
+
+    return Y_nw.to_native(), S_df, tags, coverage
 
 
 def make_future_dataframe(

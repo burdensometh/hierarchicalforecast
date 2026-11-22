@@ -283,10 +283,17 @@ class HierarchicalReconciliation:
                 )
 
             # Validate horizon against max row sum in temporal spec
-            S_cols = [c for c in S_nw.columns if c != id_time_col]
-            max_agg_factor = S_nw.with_columns(
-                sum=nw.sum_horizontal(S_cols)
-            )["sum"].max()
+            if self._s_matrix is not None:
+                # Only the id column of S is materialised for an SMatrix, so
+                # read the aggregation factors from the sparse matrix directly.
+                max_agg_factor = float(
+                    self._s_matrix.to_csr().sum(axis=1).max()
+                )
+            else:
+                S_cols = [c for c in S_nw.columns if c != id_time_col]
+                max_agg_factor = S_nw.with_columns(
+                    sum=nw.sum_horizontal(S_cols)
+                )["sum"].max()
 
            # Compute horizon: number of unique timestamps per unique_id
             # This represents the number of bottom-level periods available for reconciliation
