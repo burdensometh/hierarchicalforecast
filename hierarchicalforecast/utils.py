@@ -1,7 +1,9 @@
-__all__ = ['aggregate', 'aggregate_temporal', 'make_future_dataframe', 'get_cross_temporal_tags', 'HierarchicalPlot', 'set_num_threads', 'get_num_threads', 'SMatrix']
+__all__ = ['aggregate', 'aggregate_temporal', 'share_summing_matrix', 'make_future_dataframe', 'get_cross_temporal_tags', 'HierarchicalPlot', 'set_num_threads', 'get_num_threads', 'SMatrix']
 
 
 import itertools
+import math
+import numbers
 
 # Default OpenMP to physical cores (logical / 2) to avoid oversubscription,
 # matching PyTorch's convention. This matters when running reconciliation
@@ -11,7 +13,7 @@ import os as _os
 import reprlib
 import sys
 import timeit
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -501,6 +503,358 @@ def aggregate_temporal(
     Y_df = Y_nw.to_native()
 
     return Y_df, S_df, tags
+
+
+def _parse_share_mapping(
+    shares: Any,
+    leaf_col: str,
+    region_col: str,
+    share_col: str,
+) -> list[tuple[Any, Any, Any]]:
+    """Normalise a share mapping into an ordered list of ``(leaf, region, weight)``.
+
+    Accepted inputs are a nested mapping ``{leaf: {region: weight}}``, a
+    mapping keyed by ``(leaf, region)`` pairs, a sequence of
+    ``(leaf, region, weight)`` triples, or a dataframe with one row per
+    assignment.  The returned entries preserve input order.
+    """
+    entries: list[tuple[Any, Any, Any]] = []
+
+    if isinstance(shares, Mapping):
+        values = list(shares.values())
+        if values and all(isinstance(value, Mapping) for value in values):
+            for leaf, region_weights in shares.items():
+                for region, weight in region_weights.items():
+                    entries.append((leaf, region, weight))
+        elif values and not any(isinstance(value, Mapping) for value in values):
+            for key, weight in shares.items():
+                if not (isinstance(key, tuple) and len(key) == 2):
+                    raise ValueError(
+                        "Share mappings with scalar values must be keyed by "
+                        "(leaf, region) pairs or nested as {leaf: {region: weight}}. "
+                        f"Got key {key!r}."
+                    )
+                leaf, region = key
+                entries.append((leaf, region, weight))
+        elif values:
+            raise ValueError(
+                "Share mapping mixes nested and scalar values. Use either "
+                "{leaf: {region: weight}} or {(leaf, region): weight}."
+            )
+        return entries
+
+    def _as_triple(item: Any) -> tuple[Any, Any, Any]:
+        if isinstance(item, (str, bytes)) or isinstance(item, Mapping):
+            raise ValueError(
+                "Share assignments must be (leaf, region, weight) triples. "
+                f"Got {item!r}."
+            )
+        try:
+            values = list(item)
+        except TypeError as err:
+            raise ValueError(
+                "Share assignments must be (leaf, region, weight) triples. "
+                f"Got {item!r}."
+            ) from err
+        if len(values) != 3:
+            raise ValueError(
+                "Share assignments must be (leaf, region, weight) triples. "
+                f"Got {item!r}."
+            )
+        return values[0], values[1], values[2]
+
+    if isinstance(shares, np.ndarray):
+        if shares.ndim == 2 and shares.shape[1] == 3:
+            entries.extend(_as_triple(row) for row in shares)
+            return entries
+        if shares.ndim == 1 and shares.shape[0] == 3:
+            return [_as_triple(shares)]
+        raise ValueError(
+            "Array share mappings must have shape (n, 3) of "
+            f"(leaf, region, weight) rows. Got shape {shares.shape}."
+        )
+
+    if isinstance(shares, Sequence) and not isinstance(shares, (str, bytes)):
+        # A lone triple is accepted as well as a sequence of triples.
+        if len(shares) == 3 and not any(
+            isinstance(item, (tuple, list, np.ndarray)) for item in shares
+        ):
+            return [_as_triple(shares)]
+        for item in shares:
+            entries.append(_as_triple(item))
+        return entries
+
+    try:
+        frame = nw.from_native(shares, eager_only=True)
+    except TypeError as err:
+        raise ValueError(
+            "`shares` must be a mapping, a sequence of (leaf, region, weight) "
+            "triples, or a dataframe."
+        ) from err
+
+    missing = {leaf_col, region_col, share_col} - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"`shares` is missing required columns: {reprlib.repr(missing)}."
+        )
+    leaves = frame[leaf_col].to_list()
+    regions = frame[region_col].to_list()
+    weights = frame[share_col].to_list()
+    entries.extend(zip(leaves, regions, weights, strict=True))
+    return entries
+
+
+def share_summing_matrix(
+    leaves: Sequence[Any],
+    regions: Sequence[Any],
+    shares: Any,
+    national_label: Any = "National",
+    leaf_col: str = "leaf",
+    region_col: str = "region",
+    share_col: str = "share",
+    share_tolerance: float = 1e-8,
+    id_col: str = "unique_id",
+    backend: Any = "pandas",
+) -> "tuple[SMatrix, dict[str, np.ndarray]]":
+    r"""Build a sparse summing matrix for shared (fractional) region membership.
+
+    A single leaf (for example a store) can contribute to several aggregates
+    (for example business regions) at once, with a share that splits its sales
+    across those regions.  The resulting summing matrix ``S`` has one column per
+    leaf and three blocks of rows:
+
+    - one **national** row summing every leaf once (weight ``1``), so the
+      national total never double counts a store that belongs to several
+      regions;
+    - one **region** row per region, holding each leaf's share for that region;
+    - one **leaf** row per store, holding the identity block.
+
+    Leaves occupy the last rows, so the bottom ``n_leaves x n_leaves`` block is
+    the identity matrix and the result can be passed directly to
+    reconciliation methods (``BottomUp``, ``MinTrace``, ...).
+
+    All validation runs before the matrix is built, so malformed input raises
+    instead of producing a matrix: illegal weights (non-numeric, non-finite,
+    ``<= 0`` or ``> 1``), leaves without any share, references to unknown
+    leaves/regions, duplicated ``(leaf, region)`` assignments, and leaves whose
+    shares do not conserve to ``1``.
+
+    Args:
+        leaves (Sequence): Ordered, unique leaf identifiers (e.g. stores).
+        regions (Sequence): Ordered, unique region identifiers.
+        shares (Any): Share mapping. One of a nested mapping
+            ``{leaf: {region: weight}}``, a mapping keyed by
+            ``(leaf, region)`` pairs, a sequence of
+            ``(leaf, region, weight)`` triples, or a dataframe with columns
+            ``[leaf_col, region_col, share_col]``.
+        national_label (Any, optional): Identifier for the independent national
+            row. Must not collide with a leaf or region identifier.
+            Default is ``"National"``.
+        leaf_col (str, optional): Leaf column name for dataframe input.
+            Default is ``"leaf"``.
+        region_col (str, optional): Region column name for dataframe input.
+            Default is ``"region"``.
+        share_col (str, optional): Weight column name for dataframe input.
+            Default is ``"share"``.
+        share_tolerance (float, optional): Absolute tolerance used to decide
+            whether a leaf's shares conserve to ``1``. Default is ``1e-8``.
+        id_col (str, optional): Identifier column name stored on the returned
+            :class:`SMatrix`. Default is ``"unique_id"``.
+        backend (Any, optional): Narwhals backend used when the ``SMatrix`` is
+            materialised as a frame. Default is ``"pandas"``.
+
+    Returns:
+        tuple[SMatrix, dict[str, np.ndarray]]: The sparse summing matrix and the
+            ``tags`` mapping (``"national"``, ``"regions"``, ``"leaves"``) ready
+            for `HierarchicalReconciliation.reconcile`.
+
+    Examples:
+        >>> S_df, tags = share_summing_matrix(
+        ...     leaves=["s1", "s2"],
+        ...     regions=["north", "south"],
+        ...     shares={"s1": {"north": 0.6, "south": 0.4}, "s2": {"south": 1.0}},
+        ... )
+        >>> S_df.shape
+        (5, 2)
+    """
+    leaf_ids = list(leaves)
+    region_ids = list(regions)
+
+    if not leaf_ids:
+        raise ValueError("`leaves` must contain at least one leaf identifier.")
+    if share_tolerance < 0:
+        raise ValueError("`share_tolerance` must be non-negative.")
+
+    def _check_unique(ids: list[Any], name: str) -> None:
+        seen = set()
+        duplicates = []
+        for item in ids:
+            try:
+                already_seen = item in seen
+            except TypeError as err:
+                raise ValueError(
+                    f"`{name}` identifiers must be hashable, got {item!r}."
+                ) from err
+            if already_seen:
+                duplicates.append(item)
+            seen.add(item)
+        if duplicates:
+            raise ValueError(
+                f"`{name}` contains duplicate identifiers: {reprlib.repr(duplicates)}."
+            )
+
+    _check_unique(leaf_ids, "leaves")
+    _check_unique(region_ids, "regions")
+
+    leaf_set = set(leaf_ids)
+    region_set = set(region_ids)
+    if leaf_set & region_set:
+        raise ValueError(
+            "Leaf and region identifiers must be disjoint: "
+            f"{reprlib.repr(leaf_set & region_set)}."
+        )
+    if national_label in leaf_set or national_label in region_set:
+        raise ValueError(
+            f"`national_label` {national_label!r} collides with a leaf or region identifier."
+        )
+
+    entries = _parse_share_mapping(shares, leaf_col, region_col, share_col)
+
+    # Duplicate (leaf, region) assignments are ambiguous: reject them outright.
+    seen_pairs: set[tuple[Any, Any]] = set()
+    duplicates = []
+    for leaf, region, _ in entries:
+        pair = (leaf, region)
+        if pair in seen_pairs:
+            duplicates.append(pair)
+        seen_pairs.add(pair)
+    if duplicates:
+        raise ValueError(
+            "Duplicate (leaf, region) share assignments: "
+            f"{reprlib.repr(duplicates)}. Each pair may appear only once."
+        )
+
+    # Illegal weights: anything that cannot be a probability-like share.
+    illegal: list[tuple[Any, Any, Any, str]] = []
+    for leaf, region, weight in entries:
+        if isinstance(weight, (bool, np.bool_)) or not isinstance(weight, numbers.Real):
+            illegal.append((leaf, region, weight, "must be a real number"))
+        elif not np.isfinite(weight):
+            illegal.append((leaf, region, weight, "must be finite"))
+        elif weight <= 0 or weight > 1:
+            illegal.append((leaf, region, weight, "must be in the interval (0, 1]"))
+    if illegal:
+        details = ", ".join(
+            f"({leaf!r}, {region!r})={weight!r} {reason}"
+            for leaf, region, weight, reason in illegal[:10]
+        )
+        raise ValueError(
+            f"Invalid share weights: {details}"
+            + (f" ... ({len(illegal)} total)" if len(illegal) > 10 else "")
+        )
+
+    # References to identifiers that were not declared.
+    unknown_leaves = sorted(
+        {str(leaf) for leaf, _, _ in entries if leaf not in leaf_set}
+    )
+    unknown_regions = sorted(
+        {str(region) for _, region, _ in entries if region not in region_set}
+    )
+    if unknown_leaves:
+        raise ValueError(
+            "`shares` references leaves not present in `leaves`: "
+            f"{reprlib.repr(unknown_leaves)}."
+        )
+    if unknown_regions:
+        raise ValueError(
+            "`shares` references regions not present in `regions`: "
+            f"{reprlib.repr(unknown_regions)}."
+        )
+
+    # Coverage and conservation, evaluated per leaf.
+    weights_by_leaf: dict[Any, list[tuple[Any, float]]] = {leaf: [] for leaf in leaf_ids}
+    for leaf, region, weight in entries:
+        weights_by_leaf[leaf].append((region, float(weight)))
+
+    uncovered = [leaf for leaf in leaf_ids if not weights_by_leaf[leaf]]
+    if uncovered:
+        raise ValueError(
+            "Leaves without any share assignment: "
+            f"{reprlib.repr(uncovered)}. Every leaf must be covered."
+        )
+
+    non_conserving = []
+    for leaf in leaf_ids:
+        total = math.fsum(weight for _, weight in weights_by_leaf[leaf])
+        if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=share_tolerance):
+            non_conserving.append((leaf, total))
+    if non_conserving:
+        details = ", ".join(f"{leaf!r} sums to {total:.12g}" for leaf, total in non_conserving[:10])
+        raise ValueError(
+            "Shares for each leaf must conserve to 1: "
+            + details
+            + (f" ... ({len(non_conserving)} total)" if len(non_conserving) > 10 else "")
+        )
+
+    # Build the sparse matrix: national row, region rows, then leaf identity.
+    n_leaves = len(leaf_ids)
+    n_regions = len(region_ids)
+    region_pos = {region: i for i, region in enumerate(region_ids)}
+    leaf_pos = {leaf: j for j, leaf in enumerate(leaf_ids)}
+
+    row_idx: list[int] = []
+    col_idx: list[int] = []
+    data: list[float] = []
+
+    # National row: every leaf counted exactly once.
+    row_idx.extend([0] * n_leaves)
+    col_idx.extend(range(n_leaves))
+    data.extend([1.0] * n_leaves)
+
+    # Region rows: each leaf's fractional contribution.
+    for leaf, region, weight in entries:
+        row_idx.append(1 + region_pos[region])
+        col_idx.append(leaf_pos[leaf])
+        data.append(float(weight))
+
+    # Leaf rows: identity block (bottom of the matrix).
+    for j in range(n_leaves):
+        row_idx.append(1 + n_regions + j)
+        col_idx.append(j)
+        data.append(1.0)
+
+    n_rows = 1 + n_regions + n_leaves
+    sparse_matrix = sparse.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (row_idx, col_idx)),
+        shape=(n_rows, n_leaves),
+    ).tocsc()
+
+    def _label_array(labels: list[Any]) -> np.ndarray:
+        # ``np.array([...], dtype=object)`` collapses equal-length tuple
+        # identifiers into a 2-D array; build a flat 1-D object array instead.
+        arr = np.empty(len(labels), dtype=object)
+        arr[:] = labels
+        return arr
+
+    row_labels = _label_array([national_label, *region_ids, *leaf_ids])
+    col_labels = _label_array(leaf_ids)
+
+    S_df = SMatrix(
+        sparse_matrix=sparse_matrix,
+        row_labels=row_labels,
+        col_labels=col_labels,
+        id_col=id_col,
+        backend=backend,
+    )
+    # The bottom block is the identity by construction.
+    S_df._bottom_identity_verified = True
+
+    tags = {
+        "national": row_labels[:1].copy(),
+        "regions": row_labels[1 : 1 + n_regions].copy(),
+        "leaves": col_labels.copy(),
+    }
+    return S_df, tags
 
 
 def make_future_dataframe(

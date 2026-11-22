@@ -1,3 +1,4 @@
+import narwhals.stable.v2 as nw
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -653,3 +654,256 @@ def test_cov_equivalence():
 
     # Check equivalence of diagonal elements of shrunk W to non-shrunk W in case of no nans
     np.testing.assert_allclose(np.diag(W_np), np.diag(W_ss_nan), atol=1e-6)
+
+
+# ==============================================================================
+# Tests for share_summing_matrix (fractional leaf -> region membership)
+# ==============================================================================
+
+def _share_fixture():
+    leaves = ["s1", "s2", "s3", "s4"]
+    regions = ["north", "south"]
+    shares = {
+        "s1": {"north": 0.6, "south": 0.4},
+        "s2": {"south": 1.0},
+        "s3": {"north": 0.25, "south": 0.75},
+        "s4": {"north": 1.0},
+    }
+    return leaves, regions, shares
+
+
+def test_share_summing_matrix_layout():
+    """Rows are national, regions, leaves; columns are leaves."""
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    leaves, regions, shares = _share_fixture()
+    S_df, tags = share_summing_matrix(leaves, regions, shares)
+
+    assert S_df.shape == (1 + len(regions) + len(leaves), len(leaves))
+    assert list(S_df.row_labels) == ["National", "north", "south", *leaves]
+    assert list(S_df.col_labels) == leaves
+    np.testing.assert_array_equal(tags["national"], np.array(["National"]))
+    np.testing.assert_array_equal(tags["regions"], np.array(regions))
+    np.testing.assert_array_equal(tags["leaves"], np.array(leaves))
+
+    expected = np.array(
+        [
+            [1.0, 1.0, 1.0, 1.0],  # national: every leaf once
+            [0.6, 0.0, 0.25, 1.0],  # north
+            [0.4, 1.0, 0.75, 0.0],  # south
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    np.testing.assert_array_equal(S_df.to_dense(), expected)
+
+
+def test_share_summing_matrix_national_counts_once():
+    """The national row sums each leaf exactly once despite multi-region shares."""
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    leaves, regions, shares = _share_fixture()
+    S_df, _ = share_summing_matrix(leaves, regions, shares)
+    dense = S_df.to_dense()
+
+    np.testing.assert_array_equal(dense[0], np.ones(len(leaves)))
+    assert dense[0].sum() == len(leaves)
+    # Region rows partition each leaf's unit mass.
+    np.testing.assert_allclose(dense[1 : 1 + len(regions)].sum(axis=0), 1.0)
+
+
+def test_share_summing_matrix_bottom_identity():
+    """Leaf rows form the identity block so the matrix is reconcile-ready."""
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    leaves, regions, shares = _share_fixture()
+    S_df, _ = share_summing_matrix(leaves, regions, shares)
+
+    assert S_df.check_bottom_identity()
+    np.testing.assert_array_equal(S_df.to_dense()[-len(leaves):], np.eye(len(leaves)))
+
+
+@pytest.mark.parametrize("as_triples", [False, True])
+def test_share_summing_matrix_input_forms(as_triples):
+    """Nested mappings, triples and dataframes produce identical matrices."""
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    leaves, regions, shares = _share_fixture()
+    reference, _ = share_summing_matrix(leaves, regions, shares)
+
+    if as_triples:
+        triples = [
+            (leaf, region, weight)
+            for leaf, region_weights in shares.items()
+            for region, weight in region_weights.items()
+        ]
+        alt, _ = share_summing_matrix(leaves, regions, triples)
+    else:
+        rows = [
+            {"leaf": leaf, "region": region, "share": weight}
+            for leaf, region_weights in shares.items()
+            for region, weight in region_weights.items()
+        ]
+        alt, _ = share_summing_matrix(leaves, regions, pd.DataFrame(rows))
+
+    np.testing.assert_array_equal(reference.to_dense(), alt.to_dense())
+
+
+def test_share_summing_matrix_polars_input():
+    """A polars dataframe is accepted as share mapping."""
+    pl = pytest.importorskip("polars")
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    leaves, regions, shares = _share_fixture()
+    rows = [
+        {"leaf": leaf, "region": region, "share": weight}
+        for leaf, region_weights in shares.items()
+        for region, weight in region_weights.items()
+    ]
+    S_df, _ = share_summing_matrix(leaves, regions, pl.DataFrame(rows))
+    assert S_df.shape == (1 + len(regions) + len(leaves), len(leaves))
+
+
+def test_share_summing_matrix_array_and_single_triple():
+    """Array and lone-triple inputs are normalised to the same matrix."""
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    reference, _ = share_summing_matrix(
+        ["s1", "s2"],
+        ["north", "south"],
+        {"s1": {"north": 0.5, "south": 0.5}, "s2": {"north": 1.0}},
+    )
+    triples = [
+        ("s1", "north", 0.5),
+        ("s1", "south", 0.5),
+        ("s2", "north", 1.0),
+    ]
+    for shares in (
+        np.array(triples, dtype=object),
+        [list(t) for t in triples],
+        triples,
+    ):
+        alt, _ = share_summing_matrix(
+            ["s1", "s2"], ["north", "south"], shares
+        )
+        np.testing.assert_array_equal(reference.to_dense(), alt.to_dense())
+
+    single, _ = share_summing_matrix(["s1"], ["north"], ("s1", "north", 1.0))
+    np.testing.assert_array_equal(single.to_dense()[:, 0], [1.0, 1.0, 1.0])
+
+
+def test_share_summing_matrix_reconciles():
+    """The matrix and tags work end-to-end with dense and sparse reconcilers."""
+    from hierarchicalforecast.core import HierarchicalReconciliation
+    from hierarchicalforecast.methods import BottomUp, BottomUpSparse, MinTrace
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    leaves, regions, shares = _share_fixture()
+    S_df, tags = share_summing_matrix(leaves, regions, shares)
+    ids = list(S_df.row_labels)
+
+    rng = np.random.default_rng(0)
+    records = [
+        {"unique_id": uid, "ds": ds, "model": float(rng.normal())}
+        for uid in ids
+        for ds in range(3)
+    ]
+    Y_hat_df = pd.DataFrame(records)
+
+    for reconciler in (BottomUp(), BottomUpSparse(), MinTrace(method="ols")):
+        hrec = HierarchicalReconciliation(reconcilers=[reconciler])
+        out = hrec.reconcile(Y_hat_df=Y_hat_df, S_df=S_df, tags=tags, diagnostics=True)
+        assert len(out) == len(ids) * 3
+        coherent = nw.from_native(hrec.diagnostics).filter(
+            (nw.col("metric") == "is_coherent") & (nw.col("level") == "Overall")
+        )
+        assert coherent[coherent.columns[-1]].to_list() == [1.0]
+
+
+def _assert_share_error(shares, leaves, regions, match, **kwargs):
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    with pytest.raises(ValueError, match=match):
+        share_summing_matrix(leaves, regions, shares, **kwargs)
+
+
+def test_share_summing_matrix_rejects_illegal_weights():
+    leaves, regions = ["s1", "s2"], ["north"]
+    for bad in (1.5, 0.0, -0.2, float("nan"), float("inf"), True, "0.5"):
+        _assert_share_error(
+            {"s1": {"north": bad}, "s2": {"north": 1.0}},
+            leaves,
+            regions,
+            "Invalid share weights",
+        )
+
+
+def test_share_summing_matrix_rejects_uncovered_leaf():
+    _assert_share_error(
+        {"s1": {"north": 1.0}},
+        ["s1", "s2"],
+        ["north"],
+        "without any share assignment",
+    )
+
+
+def test_share_summing_matrix_rejects_non_conserving_leaf():
+    _assert_share_error(
+        {"s1": {"north": 0.5, "south": 0.4}, "s2": {"north": 1.0}},
+        ["s1", "s2"],
+        ["north", "south"],
+        "conserve to 1",
+    )
+
+
+def test_share_summing_matrix_rejects_duplicate_assignment():
+    _assert_share_error(
+        [("s1", "north", 0.5), ("s1", "north", 0.5), ("s2", "north", 1.0)],
+        ["s1", "s2"],
+        ["north"],
+        "Duplicate \\(leaf, region\\)",
+    )
+
+
+def test_share_summing_matrix_rejects_unknown_ids():
+    _assert_share_error(
+        {"s1": {"north": 1.0}, "ghost": {"north": 1.0}},
+        ["s1"],
+        ["north"],
+        "not present in `leaves`",
+    )
+    _assert_share_error(
+        {"s1": {"north": 0.5, "nowhere": 0.5}},
+        ["s1"],
+        ["north"],
+        "not present in `regions`",
+    )
+
+
+def test_share_summing_matrix_rejects_label_collisions():
+    _assert_share_error(
+        {"s1": {"north": 1.0}},
+        ["s1"],
+        ["north"],
+        "collides",
+        national_label="s1",
+    )
+    _assert_share_error(
+        {"a": {"a": 1.0}},
+        ["a"],
+        ["a"],
+        "must be disjoint",
+    )
+
+
+def test_share_summing_matrix_tolerance():
+    """Shares that conserve within the tolerance are accepted."""
+    from hierarchicalforecast.utils import share_summing_matrix
+
+    shares = {"s1": {"north": 0.1, "south": 0.2, "east": 0.7}}
+    S_df, _ = share_summing_matrix(
+        ["s1"], ["north", "south", "east"], shares, share_tolerance=1e-9
+    )
+    np.testing.assert_allclose(S_df.to_dense()[1:4, 0], [0.1, 0.2, 0.7])
