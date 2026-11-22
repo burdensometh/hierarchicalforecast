@@ -1397,3 +1397,233 @@ def test_smatrix_revalidates_bottom_identity_after_sparse_matrix_is_exposed():
     sparse_matrix.data[0] = 0.0
 
     assert not smat.check_bottom_identity()
+
+
+# ==============================================================================
+# Tests for date-key validation and alignment in the coordination entry point
+# ==============================================================================
+def _weekly_panel(lib="pandas"):
+    """Build a 3-store weekly panel with one identity level."""
+    dates = pd.to_datetime(["2024-01-01", "2024-01-08", "2024-01-15", "2024-01-22"])
+    rows = []
+    for sid, base in [("A", 1.0), ("B", 10.0), ("C", 100.0)]:
+        for i, ds in enumerate(dates):
+            rows.append((sid, ds, base + i))
+    Y_hat_df = pd.DataFrame(rows, columns=["unique_id", "ds", "y_model"])
+    S_df = pd.DataFrame(
+        {"unique_id": ["A", "B", "C"], "A": [1.0, 0, 0], "B": [0, 1.0, 0], "C": [0, 0, 1.0]}
+    )
+    tags = {"level": np.array(["A", "B", "C"], dtype=object)}
+    if lib == "polars":
+        Y_hat_df = pl.from_pandas(Y_hat_df)
+        S_df = pl.from_pandas(S_df)
+    return Y_hat_df, S_df, tags
+
+
+def _has_date(message, year, month, day):
+    """Match a date in either pandas (2024-01-01) or polars (2024, 1, 1) reprs."""
+    return (
+        f"{year}-{month:02d}-{day:02d}" in message
+        or f"{year}, {month}, {day}" in message
+    )
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_reconcile_rejects_duplicated_rows(lib):
+    """A duplicated (unique_id, ds) row is reported with the offending store/date."""
+    Y_hat_df, S_df, tags = _weekly_panel(lib)
+    bad = nw.from_native(Y_hat_df)
+    duplicated = nw.concat([bad, bad.filter(nw.col("unique_id") == "B").head(1)])
+    duplicated = duplicated.to_native()
+
+    hrec = HierarchicalReconciliation([BottomUp()])
+    with pytest.raises(ValueError) as excinfo:
+        hrec.reconcile(Y_hat_df=duplicated, S_df=S_df, tags=tags)
+    message = str(excinfo.value)
+    assert "duplicated rows" in message
+    assert "unique_id='B'" in message
+    assert _has_date(message, 2024, 1, 1)
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_reconcile_reports_shifted_store_and_dates(lib):
+    """A store that drops Monday and adds a Thursday is named with both dates.
+
+    The row count stays equal across stores, so a positional reshape would
+    silently move every later value onto the wrong date.
+    """
+    Y_hat_df, S_df, tags = _weekly_panel(lib)
+    frame = nw.from_native(Y_hat_df)
+    drop_date = pd.Timestamp("2024-01-01")
+    extra_date = pd.Timestamp("2024-01-25")
+    frame = frame.filter(~((nw.col("unique_id") == "B") & (nw.col("ds") == drop_date)))
+    extra = nw.from_dict(
+        {
+            "unique_id": ["B"] * 1,
+            "ds": [extra_date] if lib == "pandas" else [extra_date.to_pydatetime()],
+            "y_model": [999.0],
+        },
+        backend=nw.from_native(Y_hat_df).implementation,
+    )
+    bad = nw.concat([frame, extra]).to_native()
+
+    hrec = HierarchicalReconciliation([BottomUp()])
+    with pytest.raises(ValueError) as excinfo:
+        hrec.reconcile(Y_hat_df=bad, S_df=S_df, tags=tags)
+
+    message = str(excinfo.value)
+    assert "unique_id='B'" in message
+    assert _has_date(message, 2024, 1, 1)  # missing Monday
+    assert _has_date(message, 2024, 1, 25)  # unexpected Thursday
+    # The aligned stores must not be blamed.
+    assert "unique_id='A'" not in message
+    assert "unique_id='C'" not in message
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_reconcile_row_order_does_not_change_results(lib):
+    """Shuffled or reversed input produces the same reconciled matrix."""
+    Y_hat_df, S_df, tags = _weekly_panel(lib)
+    frame = nw.from_native(Y_hat_df)
+
+    def run(data):
+        hrec = HierarchicalReconciliation([BottomUp(), MinTrace(method="ols")])
+        return nw.from_native(
+            hrec.reconcile(Y_hat_df=data, S_df=S_df, tags=tags)
+        )
+
+    base = run(Y_hat_df)
+    shuffled = run(frame.sample(fraction=1.0, seed=0).to_native())
+    reversed_ = run(
+        frame.sort(by=["unique_id", "ds"], descending=[True, True]).to_native()
+    )
+
+    for other in (shuffled, reversed_):
+        assert base.columns == other.columns
+        np.testing.assert_allclose(
+            base["y_model/BottomUp"].to_numpy(),
+            other["y_model/BottomUp"].to_numpy(),
+        )
+        np.testing.assert_allclose(
+            base["y_model/MinTrace_method-ols"].to_numpy(),
+            other["y_model/MinTrace_method-ols"].to_numpy(),
+        )
+        np.testing.assert_array_equal(
+            base["unique_id"].to_numpy(), other["unique_id"].to_numpy()
+        )
+        np.testing.assert_array_equal(
+            base["ds"].to_numpy(), other["ds"].to_numpy()
+        )
+
+
+def test_insample_values_align_to_forecast_dates():
+    """History actuals are matched by date, not by row position.
+
+    Each store's history is shifted by a different offset so that a positional
+    reshape would pair a store's forecast date with another date's actual.
+    """
+    Y_hat_df, S_df, tags = _weekly_panel("pandas")
+    hist_dates = pd.date_range("2023-10-02", periods=12, freq="7D")
+    rows = []
+    for sid, base in [("A", 1.0), ("B", 10.0), ("C", 100.0)]:
+        for i, ds in enumerate(hist_dates):
+            rows.append((sid, ds, base * 100 + i))
+    Y_df = pd.DataFrame(rows, columns=["unique_id", "ds", "y"])
+    # A fitted column is required for MinTrace's insample residual estimates.
+    Y_df["y_model"] = Y_df["y"]
+
+    # Shuffle the history; alignment must still be by key.
+    Y_df = Y_df.sample(frac=1.0, random_state=3).reset_index(drop=True)
+
+    hrec = HierarchicalReconciliation([MinTrace(method="ols")])
+    result = nw.from_native(
+        hrec.reconcile(Y_hat_df=Y_hat_df, Y_df=Y_df, S_df=S_df, tags=tags)
+    )
+
+    # Rebuild the expected matrix by explicit key lookup.
+    frame = nw.from_native(Y_df)
+    expected = (
+        frame.sort(by=["unique_id", "ds"])["y_model"]
+        .to_numpy()
+        .reshape(3, -1)
+    )
+    np.testing.assert_allclose(hrec._prepare_Y(
+        Y_nw=nw.from_native(Y_df).sort(by=["unique_id", "ds"]),
+        S_nw=nw.from_native(S_df),
+        is_balanced=False,
+    ), expected)
+    assert len(result) == len(Y_hat_df)
+
+
+def test_reconcile_rejects_duplicated_insample_rows():
+    """Duplicated history dates are rejected with the store and date."""
+    Y_hat_df, S_df, tags = _weekly_panel("pandas")
+    hist_dates = pd.date_range("2024-01-01", periods=4, freq="7D")
+    Y_df = pd.DataFrame(
+        {"unique_id": np.repeat(["A", "B", "C"], 4),
+         "ds": list(hist_dates) * 3,
+         "y": np.arange(12.0),
+         "y_model": np.arange(12.0)}
+    )
+    bad = pd.concat([Y_df, Y_df.head(1)], ignore_index=True)
+
+    hrec = HierarchicalReconciliation([MinTrace(method="ols")])
+    with pytest.raises(ValueError, match=r"Check `Y_df`.*duplicated rows"):
+        hrec.reconcile(Y_hat_df=Y_hat_df, Y_df=bad, S_df=S_df, tags=tags)
+
+
+def test_temporal_reconcile_rejects_misaligned_series():
+    """Temporal reconciliation reports a series whose level/date keys drift."""
+    df = pd.DataFrame({
+        "unique_id": ["A"] * 8 + ["B"] * 8,
+        "ds": pd.date_range("2020-01-01", periods=8, freq="QS").tolist() * 2,
+        "y": list(range(10, 90, 10)) * 2,
+    })
+    Y_df, S_df, tags = aggregate_temporal(df, {"year": 4, "quarter": 1})
+    Y_hat_df = Y_df.rename(columns={"y": "y_model"})
+
+    # Drop one bottom-level period from series B so its date axis no longer
+    # matches A's, while the temporal level ids stay the same.
+    mask = (Y_hat_df["unique_id"] == "B") & (Y_hat_df["temporal_id"] == "quarter-3")
+    bad = Y_hat_df[~mask]
+
+    hrec = HierarchicalReconciliation([BottomUp()])
+    with pytest.raises(ValueError) as excinfo:
+        hrec.reconcile(Y_hat_df=bad, S_df=S_df, tags=tags, temporal=True)
+
+    message = str(excinfo.value)
+    assert "unique_id='B'" in message
+    assert "quarter-3" in message
+    assert "unique_id='A'" not in message
+
+
+def test_temporal_reconcile_allows_local_aggregation_with_distinct_dates():
+    """Local temporal aggregation gives each series its own dates per level.
+
+    That is legitimate: only the temporal levels must match across series, not
+    the underlying ``ds`` values used to label each level.
+    """
+    df = pd.DataFrame({
+        "unique_id": ["A"] * 8 + ["B"] * 8,
+        "ds": list(pd.date_range("2020-01-01", periods=8, freq="QS"))
+        + list(pd.date_range("2021-01-01", periods=8, freq="QS")),
+        "y": list(range(8)) * 2,
+    })
+    Y_df, S_df, tags = aggregate_temporal(
+        df, {"year": 4, "quarter": 1}, aggregation_type="local"
+    )
+    Y_hat_df = Y_df.rename(columns={"y": "y_model"})
+
+    # A and B share temporal levels but not the dates that label them.
+    assert (
+        Y_df.loc[Y_df["temporal_id"] == "year-1", ["unique_id", "ds"]]
+        .drop_duplicates()["ds"]
+        .nunique()
+        == 2
+    )
+
+    result = HierarchicalReconciliation([BottomUp()]).reconcile(
+        Y_hat_df=Y_hat_df, S_df=S_df, tags=tags, temporal=True
+    )
+    assert result is not None
+    assert "y_model/BottomUp" in nw.from_native(result).columns

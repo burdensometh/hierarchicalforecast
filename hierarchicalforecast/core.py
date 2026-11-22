@@ -126,6 +126,135 @@ def _aggregate_diagnostics(
     return df.to_native()
 
 
+def _format_key_values(values, max_items: int = 5) -> str:
+    """Render a small list of key tuples for an error message."""
+    values = sorted(values, key=str)
+    shown = ", ".join(repr(value) for value in values[:max_items])
+    if len(values) > max_items:
+        shown += f", ... ({len(values)} values in total)"
+    return f"[{shown}]"
+
+
+def _key_label(key_cols: list[str]) -> str:
+    return key_cols[0] if len(key_cols) == 1 else f"({', '.join(key_cols)})"
+
+
+def _check_duplicate_keys(
+    frame: Frame,
+    series_col: str,
+    key_cols: list[str],
+    frame_name: str,
+) -> None:
+    """Raise if a ``(series_col, *key_cols)`` combination appears more than once.
+
+    Duplicated keys make the positional ``(n_series, horizon)`` matrices built
+    later ambiguous, so they are rejected with the offending series/keys.
+    """
+    counts = nw.maybe_reset_index(
+        frame.group_by([series_col, *key_cols]).agg(nw.len().alias("__nw_count"))
+    )
+    duplicates = counts.filter(nw.col("__nw_count") > 1).sort(
+        by=[series_col, *key_cols]
+    )
+    if len(duplicates) == 0:
+        return
+
+    def key_of(row):
+        values = tuple(row[col] for col in key_cols)
+        return values[0] if len(key_cols) == 1 else values
+
+    details = [
+        f"{series_col}={row[series_col]!r}, {_key_label(key_cols)}={key_of(row)!r} "
+        f"({int(row['__nw_count'])} rows)"
+        for row in duplicates.rows(named=True)
+    ]
+    max_items = 10
+    shown = "; ".join(details[:max_items])
+    if len(details) > max_items:
+        shown += f"; ... ({len(details)} duplicated keys in total)"
+    raise ValueError(
+        f"Check `{frame_name}`, found duplicated rows for the same "
+        f"`{series_col}` and `{_key_label(key_cols)}`: {shown}."
+    )
+
+
+def _check_key_axis(
+    frame: Frame,
+    series_col: str,
+    key_cols: list[str],
+    frame_name: str,
+) -> None:
+    """Raise unless every series has exactly the same set of key values.
+
+    The matrices consumed by the reconcilers are built by reshaping rows in
+    ``(series, key)`` order, so only shared key sets make those positions
+    meaningful. When a minority of series drifts (for example one store drops a
+    Monday and adds a Thursday while keeping the same row count), the reference
+    axis is taken from the key set shared by the majority of series. That
+    pinpoints the offending series and both of its keys instead of blaming the
+    stores that are aligned.
+    """
+    pairs = frame.select([series_col, *key_cols]).unique()
+    n_series = pairs[series_col].n_unique()
+
+    per_key = nw.maybe_reset_index(
+        pairs.group_by(key_cols).agg(
+            nw.col(series_col).n_unique().alias("__nw_series")
+        )
+    )
+    # Fast path: every key appears in every series, so the axes already match.
+    if (per_key["__nw_series"] == n_series).all():
+        return
+
+    def key_of(row):
+        values = tuple(row[col] for col in key_cols)
+        return values[0] if len(key_cols) == 1 else values
+
+    series_keys: dict = {}
+    for row in pairs.rows(named=True):
+        series_keys.setdefault(row[series_col], set()).add(key_of(row))
+
+    # Take the most common key set as the reference axis. Only trust it when a
+    # single set is the strict plurality; otherwise fall back to the union so
+    # every deviation is reported without arbitrarily siding with one group.
+    set_counts: dict = {}
+    for keys in series_keys.values():
+        frozen = frozenset(keys)
+        set_counts[frozen] = set_counts.get(frozen, 0) + 1
+    ranked = sorted(set_counts.items(), key=lambda item: item[1], reverse=True)
+    if ranked and (len(ranked) == 1 or ranked[0][1] > ranked[1][1]):
+        reference = set(ranked[0][0])
+    else:
+        reference = set().union(*series_keys.values())
+
+    issues: dict = {}
+    for series, seen in series_keys.items():
+        extra = sorted(seen - reference, key=str)
+        missing = sorted(reference - seen, key=str)
+        if extra or missing:
+            issues[series] = {"missing": missing, "extra": extra}
+
+    label = _key_label(key_cols)
+    details = []
+    for series in sorted(issues, key=str):
+        issue = issues[series]
+        parts = []
+        if issue["missing"]:
+            parts.append(
+                f"missing {label} values {_format_key_values(issue['missing'])}"
+            )
+        if issue["extra"]:
+            parts.append(
+                f"unexpected {label} values {_format_key_values(issue['extra'])}"
+            )
+        details.append(f"{series_col}={series!r}: " + " and ".join(parts))
+
+    raise ValueError(
+        f"Check `{frame_name}`, each series must have the same `{label}` "
+        f"values but the following series are misaligned: " + "; ".join(details) + "."
+    )
+
+
 def _build_fn_name(fn) -> str:
     fn_name = type(fn).__name__
     # Use _init_params if available, otherwise fall back to __dict__ for backwards compatibility
@@ -256,11 +385,14 @@ class HierarchicalReconciliation:
         target_col: str = "y",
         id_time_col: str = "temporal_id",
         temporal: bool = False,
+        is_balanced: bool = False,
         skip_identity_check: bool = False,
     ) -> tuple[FrameT, FrameT, FrameT, list[str], str]:
         """Performs preliminary wrangling and protections."""
         Y_hat_nw_cols = Y_hat_nw.columns
         S_nw_cols = S_nw.columns
+        # Keep the series identifier before `id_col` is repurposed for temporal IDs.
+        series_col = id_col
 
         # Check if Y_hat_df has the necessary columns for temporal
         if temporal:
@@ -288,16 +420,6 @@ class HierarchicalReconciliation:
                 sum=nw.sum_horizontal(S_cols)
             )["sum"].max()
 
-           # Compute horizon: number of unique timestamps per unique_id
-            # This represents the number of bottom-level periods available for reconciliation
-            horizon = Y_hat_nw.group_by(id_col).agg(nw.col(time_col).n_unique().alias("count"))["count"].max()
-            if horizon < max_agg_factor:
-                raise ValueError(
-                    f"The forecast horizon ({horizon}) must be greater than or equal to "
-                    f"the maximum aggregation factor in temporal_spec ({max_agg_factor}). "
-                    f"Ensure you have at least {max_agg_factor} forecast periods."
-                )
-
             missing_cols_temporal = set([id_col, time_col, id_time_col]) - set(
                 Y_hat_nw_cols
             )
@@ -309,8 +431,36 @@ class HierarchicalReconciliation:
                 raise ValueError(
                     f"Check `S_df` columns, {reprlib.repr(id_time_col)} must be in `S_df` columns."
                 )
+
+            # Temporal matrices reshape in `(temporal_id, ds)` order, so every
+            # series must expose the same temporal levels before any matrix is
+            # built. `ds` repeats across levels and, for local aggregations,
+            # may legitimately differ per series, so the level id is the key.
+            _check_duplicate_keys(Y_hat_nw, series_col, [id_time_col], "Y_hat_df")
+            _check_key_axis(Y_hat_nw, series_col, [id_time_col], "Y_hat_df")
+
+            # Compute horizon: number of unique timestamps per series.
+            # This represents the number of bottom-level periods available for reconciliation
+            horizon = (
+                Y_hat_nw.group_by(series_col)
+                .agg(nw.col(time_col).n_unique().alias("count"))["count"]
+                .max()
+            )
+            if horizon < max_agg_factor:
+                raise ValueError(
+                    f"The forecast horizon ({horizon}) must be greater than or equal to "
+                    f"the maximum aggregation factor in temporal_spec ({max_agg_factor}). "
+                    f"Ensure you have at least {max_agg_factor} forecast periods."
+                )
+
             id_cols = [id_col, time_col, target_col, id_time_col]
             id_col = id_time_col
+
+            # Check if Y_hat_df has the right shape
+            if len(Y_hat_nw.group_by(id_col).agg(nw.len()).unique(subset="len")) != 1:
+                raise ValueError(
+                    "Check `Y_hat_df`, there are missing timestamps. All series should have the same number of predictions."
+                )
         else:
             id_cols = [id_col, time_col, target_col]
             if id_col not in S_nw_cols:
@@ -318,11 +468,23 @@ class HierarchicalReconciliation:
                     f"Check `S_df` columns, {reprlib.repr(id_col)} must be in `S_df` columns."
                 )
 
-        # Check if Y_hat_df has the right shape
-        if len(Y_hat_nw.group_by(id_col).agg(nw.len()).unique(subset="len")) != 1:
-            raise ValueError(
-                "Check `Y_hat_df`, there are missing timestamps. All series should have the same number of predictions."
-            )
+            # Base forecasts are reshaped in `(unique_id, ds)` order, so validate
+            # the date keys before building any matrix.
+            _check_duplicate_keys(Y_hat_nw, id_col, [time_col], "Y_hat_df")
+            _check_key_axis(Y_hat_nw, id_col, [time_col], "Y_hat_df")
+
+            # Check if Y_hat_df has the right shape
+            if len(Y_hat_nw.group_by(id_col).agg(nw.len()).unique(subset="len")) != 1:
+                raise ValueError(
+                    "Check `Y_hat_df`, there are missing timestamps. All series should have the same number of predictions."
+                )
+
+        # In-sample history is aligned onto the forecast's date axis below. An
+        # explicitly balanced history must already share that axis.
+        if Y_nw is not None:
+            _check_duplicate_keys(Y_nw, series_col, [time_col], "Y_df")
+            if is_balanced:
+                _check_key_axis(Y_nw, series_col, [time_col], "Y_df")
 
         # -------------------------------- Match Y_hat/Y/S index order --------------------------------#
         # TODO: This is now a bit slow as we always sort.
@@ -467,7 +629,14 @@ class HierarchicalReconciliation:
         time_col: str = "ds",
         target_col: str = "y",
     ) -> np.ndarray:
-        """Prepare Y data."""
+        """Prepare Y data.
+
+        When ``is_balanced`` is True the values are reshaped positionally, which
+        callers may only do after :func:`_check_key_axis` confirmed every series
+        shares one sorted date axis (as done in ``_prepare_fit``). Otherwise the
+        frame is pivoted by date, so each series keeps its own date axis and
+        missing dates become ``NaN`` instead of borrowing a neighbour's value.
+        """
         if is_balanced:
             Y = Y_nw[target_col].to_numpy().reshape(len(S_nw), -1)
         else:
@@ -544,7 +713,7 @@ class HierarchicalReconciliation:
             intervals_method (str, optional): method used to calculate prediction intervals, one of `normality`, `bootstrap`, `permbu`. Default is "normality".
             num_samples (int, optional): if positive return that many probabilistic coherent samples. Default is -1.
             seed (int, optional): random seed for numpy generator's replicability. Default is 0.
-            is_balanced (bool, optional): wether `Y_df` is balanced, set it to True to speed things up if `Y_df` is balanced. Default is False.
+            is_balanced (bool, optional): wether `Y_df` is balanced, set it to True to speed things up if `Y_df` is balanced. A balanced `Y_df` must also share one date axis across series; otherwise the history is aligned to the forecast dates by key, so row order does not matter. Default is False.
             id_col (str, optional): column that identifies each serie. Default is "unique_id".
             time_col (str, optional): column that identifies each timestep, its values can be timestamps or integers. Default is "ds".
             target_col (str, optional): column that contains the target. Default is "y".
@@ -602,6 +771,7 @@ class HierarchicalReconciliation:
             target_col=target_col,
             id_time_col=id_time_col,
             temporal=temporal,
+            is_balanced=is_balanced,
             skip_identity_check=self._s_matrix is not None,
         )
 
