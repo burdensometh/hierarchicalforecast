@@ -68,6 +68,7 @@
           "core.html",
           "methods.html",
           "probabilistic_methods.html",
+          "calibration.html",
           "evaluation.html",
           "utils.html"
         ]
