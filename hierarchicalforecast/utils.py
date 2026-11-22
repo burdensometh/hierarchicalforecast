@@ -1,4 +1,4 @@
-__all__ = ['aggregate', 'aggregate_temporal', 'make_future_dataframe', 'get_cross_temporal_tags', 'HierarchicalPlot', 'set_num_threads', 'get_num_threads', 'SMatrix']
+__all__ = ['aggregate', 'aggregate_temporal', 'decode_path', 'encode_path', 'make_future_dataframe', 'get_cross_temporal_tags', 'HierarchicalPlot', 'set_num_threads', 'get_num_threads', 'SMatrix']
 
 
 import itertools
@@ -160,17 +160,124 @@ def _is_strictly_hierarchical(
     return np.all(A.sum(axis=0).A1[len(next(iter(tags.values()))) :] == 1)
 
 
+_LEVEL_SEP = "/"
+# The encoding is only applied when a component actually needs it, so ordinary
+# identifiers (the common case, including values like "50%") stay byte-for-byte
+# identical to the historical "/"-joined names. `%` is always encoded before
+# `/`, and a component is escaped whenever it contains a raw separator or
+# anything that looks like an escape sequence, which keeps the mapping
+# reversible (`%2F` in the data becomes `%252F`, never `%2F`).
+_ESCAPE_REPLACEMENTS = (("%", "%25"), (_LEVEL_SEP, "%2F"))
+_ESCAPE_MARKERS = ("%2F", "%25")
+
+
+def _needs_escape(expr: nw.Expr) -> nw.Expr:
+    """Whether any value contains the separator or an escape marker."""
+    mask = expr.str.contains(_LEVEL_SEP, literal=True)
+    for marker in _ESCAPE_MARKERS:
+        mask = mask | expr.str.contains(marker, literal=True)
+    return mask
+
+
+def _escape_path_text(text: str) -> str:
+    for old, new in _ESCAPE_REPLACEMENTS:
+        text = text.replace(old, new)
+    return text
+
+
+def _encode_path_component(col: str) -> nw.Expr:
+    """Cast a column to string and, when needed, escape the level separator.
+
+    Values that contain neither ``/`` nor ``%2F``/``%25`` are returned
+    unchanged; the others are percent-escaped so that the identifier built
+    from them is reversible.
+
+    Args:
+        col (str): Name of the column to encode.
+
+    Returns:
+        nw.Expr: Expression with the encoded string values.
+    """
+    text = nw.concat_str([nw.col(col), nw.lit("")], separator="")
+    escaped = text
+    # `%` and `/` are not regex metacharacters, so the default (regex) replace
+    # behaves literally across backends while the replacements stay free of
+    # backreferences.
+    for old, new in _ESCAPE_REPLACEMENTS:
+        escaped = escaped.str.replace_all(old, new)
+    return nw.when(_needs_escape(text)).then(escaped).otherwise(text)
+
+
+def decode_path(path: str) -> list[str]:
+    """Split an encoded path identifier back into its raw components.
+
+    Reverse counterpart of the identifiers produced by
+    :func:`~hierarchicalforecast.utils.aggregate`. Components that contain the
+    level separator keep it verbatim, and literal ``%`` characters round-trip.
+
+    Args:
+        path (str): Encoded path identifier, e.g. ``"Country/State%2FRegion"``.
+
+    Returns:
+        list[str]: Raw components of the path.
+    """
+    if not isinstance(path, str):
+        raise TypeError(f"path must be a string, got {type(path).__name__}")
+    decoded = []
+    for part in path.split(_LEVEL_SEP):
+        part = part.replace("%2F", _LEVEL_SEP).replace("%25", "%")
+        decoded.append(part)
+    return decoded
+
+
+def encode_path(parts: Sequence[str]) -> str:
+    """Join raw string components into a reversible path identifier.
+
+    Components are escaped only when they contain ``/`` or an escape marker, so
+    the result matches the historical ``"/"``-joined identifier for ordinary
+    names and can always be split back with :func:`decode_path`.
+
+    Args:
+        parts (Sequence[str]): Raw string components, outermost first.
+
+    Returns:
+        str: Encoded path identifier.
+    """
+    encoded = []
+    for part in parts:
+        if not isinstance(part, str):
+            raise TypeError(
+                f"path components must be strings, got {type(part).__name__}"
+            )
+        if _LEVEL_SEP in part or any(marker in part for marker in _ESCAPE_MARKERS):
+            part = _escape_path_text(part)
+        encoded.append(part)
+    return _LEVEL_SEP.join(encoded)
+
+
+def _join_encoded(columns: Sequence[str]) -> nw.Expr:
+    """Concatenate the encoded values of several columns into a path id."""
+    return nw.concat_str(
+        [_encode_path_component(col) for col in columns], separator=_LEVEL_SEP
+    )
+
+
 def _to_upper_hierarchy(
-    bottom_split: list[str], bottom_values: str, upper_key: str
+    bottom_split: Sequence[str],
+    bottom_values: np.ndarray,
+    upper_levels: Sequence[str],
 ) -> list[str]:
-    upper_split = upper_key.split("/")
-    upper_idxs = [bottom_split.index(i) for i in upper_split]
+    """Derive the parent level identifiers from the bottom level identifiers.
 
-    def join_upper(bottom_value):
-        bottom_parts = bottom_value.split("/")
-        return "/".join(bottom_parts[i] for i in upper_idxs)
-
-    return [join_upper(val) for val in bottom_values]
+    Values are encoded path identifiers, whose components never contain the
+    separator, so splitting and re-joining keeps every parent traceable to its
+    own path even when the raw category values contain ``"/"``.
+    """
+    upper_idxs = [bottom_split.index(col) for col in upper_levels]
+    return [
+        _LEVEL_SEP.join(val.split(_LEVEL_SEP)[i] for i in upper_idxs)
+        for val in bottom_values
+    ]
 
 
 def aggregate(
@@ -205,6 +312,14 @@ def aggregate(
             S_df: Summing dataframe. When ``sparse_s=True``, returns an
                 :class:`SMatrix` instead of a DataFrame.
             tags: Aggregation indices.
+
+    Notes:
+        Series identifiers are built by joining the level values with ``"/"``.
+        Values containing ``/`` (or a ``%2F``/``%25`` marker) are percent-escaped
+        first, so identifiers are unambiguous and reversible with
+        :func:`~hierarchicalforecast.utils.decode_path` even when category
+        values (product names, warehouse names, ...) contain slashes. Values
+        without those characters keep their previous identifier unchanged.
     """
     # To Narwhals
     target_cols = list(target_cols)
@@ -286,7 +401,7 @@ def aggregate(
     tags = {}
     Y_nws = []
     category_list = []
-    level_sep = "/"
+    level_sep = _LEVEL_SEP
     # Perform the aggregation
     for level in spec:
         level_name = level_sep.join(level)
@@ -299,9 +414,7 @@ def aggregate(
             ]
         )
         Y_level = Y_level.select(
-            nw.concat_str([nw.col(col) for col in level], separator=level_sep).alias(
-                _id_col
-            ),
+            _join_encoded(level).alias(_id_col),
             nw.all(),
         )
         # For temporal aggregation, we need to keep the time column
@@ -334,9 +447,7 @@ def aggregate(
         bottom = spec_cols
         bottom_levels = (
             df_nw.select(
-                nw.concat_str(
-                    [nw.col(col) for col in bottom], separator=level_sep
-                ).alias(_id_col)
+                _join_encoded(bottom).alias(_id_col)
             )
             .unique(subset=[_id_col], maintain_order=temporal_agg, keep="last")[_id_col]
             .to_numpy()
@@ -351,7 +462,7 @@ def aggregate(
     S = np.empty((len(bottom_levels), len(spec)), dtype=object)
 
     for j, levels in enumerate(spec[:-1]):
-        S[:, j] = _to_upper_hierarchy(bottom, bottom_levels, level_sep.join(levels))
+        S[:, j] = _to_upper_hierarchy(bottom, bottom_levels, levels)
     S[:, -1] = bottom_levels
 
     encoder = OneHotEncoder(

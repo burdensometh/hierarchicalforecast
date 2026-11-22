@@ -659,6 +659,94 @@ def test_bottomup_sparse_works_with_grouped_hierarchy(common_test_data):
     assert 'y_model/BottomUpSparse' in reconciled.columns
 
 
+@pytest.fixture(scope="module")
+def slash_hierarchy_data():
+    """Hierarchy whose values contain the level separator.
+
+    ``("R", "S/T", "P")`` and ``("R", "S", "T/P")`` are distinct leaves that a
+    naive "/"-join used to collapse into a single ``"R/S/T/P"`` series.
+    """
+    leaves = [
+        ("R", "S/T", "P", 10.0),
+        ("R", "S", "T/P", 20.0),
+        ("R", "S", "Q", 5.0),
+    ]
+    dates = pd.date_range("2020-01-01", periods=4, freq="MS")
+    rows = []
+    for region, store, product, base in leaves:
+        for i, ds in enumerate(dates):
+            rows.append(
+                {
+                    "region": region,
+                    "store": store,
+                    "product": product,
+                    "ds": ds,
+                    "y": base + i,
+                }
+            )
+    df = pd.DataFrame(rows)
+    spec = [["region"], ["region", "store"], ["region", "store", "product"]]
+
+    def build(frame, **kwargs):
+        Y_df, S_df, tags = aggregate(frame, spec, **kwargs)
+        Y_df = Y_df.to_pandas() if hasattr(Y_df, "to_pandas") else Y_df
+        Y_df["y_model"] = Y_df["y"]
+        Y_hat_df = Y_df.groupby("unique_id", group_keys=False).tail(2).copy()
+        return Y_df, Y_hat_df, S_df, tags
+
+    Y_df, Y_hat_df, S_df, tags = build(df)
+    _, _, S_sparse, tags_sparse = build(df, sparse_s=True)
+    return {
+        "Y_df": Y_df,
+        "Y_hat_df": Y_hat_df,
+        "S_df": S_df,
+        "S_sparse": S_sparse,
+        "tags": tags,
+        "tags_sparse": tags_sparse,
+    }
+
+
+@pytest.mark.parametrize("sparse_s", [False, True])
+def test_bottomup_slash_hierarchy_keeps_shared_parent(
+    slash_hierarchy_data, sparse_s
+):
+    """Bottom-up must aggregate shared parents over the right leaves only."""
+    from hierarchicalforecast.utils import decode_path
+    data = slash_hierarchy_data
+    S = data["S_sparse"] if sparse_s else data["S_df"]
+    tags = data["tags_sparse"] if sparse_s else data["tags"]
+
+    leaves = tags["region/store/product"].tolist()
+    assert len(leaves) == 3
+    decoded = sorted(decode_path(uid) for uid in leaves)
+    assert decoded == [
+        ["R", "S", "Q"],
+        ["R", "S", "T/P"],
+        ["R", "S/T", "P"],
+    ]
+
+    hrec = HierarchicalReconciliation([BottomUp()])
+    reconciled = hrec.reconcile(
+        Y_hat_df=data["Y_hat_df"], Y_df=data["Y_df"], S_df=S, tags=tags
+    )
+    reconciled = nw.from_native(reconciled).to_native()
+
+    def series(uid):
+        return reconciled.loc[reconciled["unique_id"] == uid, "y_model/BottomUp"].to_numpy()
+
+    # Each leaf keeps its own forecast.
+    np.testing.assert_allclose(series("R/S%2FT/P"), [12.0, 13.0])
+    np.testing.assert_allclose(series("R/S/T%2FP"), [22.0, 23.0])
+    np.testing.assert_allclose(series("R/S/Q"), [7.0, 8.0])
+
+    # ``R/S%2FT`` (store "S/T") aggregates only its single child...
+    np.testing.assert_allclose(series("R/S%2FT"), [12.0, 13.0])
+    # ...while ``R/S`` (store "S") aggregates only ("R", "S", "T/P") and
+    # ("R", "S", "Q"), not the other branch that used to share the id.
+    np.testing.assert_allclose(series("R/S"), [29.0, 31.0])
+    np.testing.assert_allclose(series("R"), [41.0, 44.0])
+
+
 @pytest.mark.parametrize("method", ["ols", "wls_struct"])
 def test_mintrace_works_with_grouped_hierarchy(common_test_data, method):
     """Test that MinTrace works correctly with grouped data."""

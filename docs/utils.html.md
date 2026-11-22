@@ -22,6 +22,10 @@ external libraries into a compatible data frame format.
 
 ::: hierarchicalforecast.utils.aggregate_temporal
 
+::: hierarchicalforecast.utils.encode_path
+
+::: hierarchicalforecast.utils.decode_path
+
 ::: hierarchicalforecast.utils.make_future_dataframe
 
 ::: hierarchicalforecast.utils.get_cross_temporal_tags

@@ -12,6 +12,7 @@ from hierarchicalforecast.utils import (
     _shrunk_covariance_schaferstrimmer_with_nans,
     aggregate,
     aggregate_temporal,
+    decode_path,
     get_cross_temporal_tags,
     level_to_outputs,
     make_future_dataframe,
@@ -69,6 +70,140 @@ def test_simple_case(df, spec):
 
     Y_df2, *_ = aggregate(df2, spec)
     assert Y_df.shape[0] == Y_df2.shape[0]
+
+
+@pytest.fixture
+def df_with_slashes():
+    # Two distinct leaves whose naive "/"-joined identifiers collide:
+    # ("COUNTRY", "x/y", "z") and ("COUNTRY", "x", "y/z") both used to
+    # produce "COUNTRY/x/y/z".
+    return pd.DataFrame(
+        {
+            'country': ['COUNTRY', 'COUNTRY'],
+            'cat1': ['x/y', 'x'],
+            'cat2': ['z', 'y/z'],
+            'y': [10.0, 20.0],
+            'ds': ['2020-01-01', '2020-01-01'],
+        }
+    )
+
+
+def test_slash_paths_are_distinct(df_with_slashes):
+    spec = [['country'], ['country', 'cat1'], ['country', 'cat1', 'cat2']]
+    for df in (df_with_slashes, pl.from_pandas(df_with_slashes)):
+        Y_df, S_df, tags = aggregate(df, spec)
+        Y_df = Y_df.to_pandas() if hasattr(Y_df, 'to_pandas') else Y_df
+        if isinstance(S_df, pl.DataFrame):
+            S_df = S_df.to_pandas()
+
+        bottom = tags['country/cat1/cat2'].tolist()
+        assert len(bottom) == 2
+        assert len(set(bottom)) == 2
+
+        # The two leaves remain independently traceable.
+        decoded = sorted(decode_path(uid) for uid in bottom)
+        assert decoded == [['COUNTRY', 'x', 'y/z'], ['COUNTRY', 'x/y', 'z']]
+        assert sorted(Y_df.query('unique_id in @bottom')['y'].tolist()) == [10.0, 20.0]
+
+        # Intermediate level names round-trip too.
+        middle = sorted(decode_path(uid) for uid in tags['country/cat1'].tolist())
+        assert middle == [['COUNTRY', 'x'], ['COUNTRY', 'x/y']]
+
+        # S_df has one row per series, the bottom block is an identity and
+        # every bottom row sums only into its own path.
+        assert S_df['unique_id'].tolist() == [
+            'COUNTRY',
+            'COUNTRY/x',
+            'COUNTRY/x%2Fy',
+            'COUNTRY/x%2Fy/z',
+            'COUNTRY/x/y%2Fz',
+        ]
+        assert S_df.columns.tolist() == [
+            'unique_id',
+            'COUNTRY/x%2Fy/z',
+            'COUNTRY/x/y%2Fz',
+        ]
+        bottom_block = S_df.set_index('unique_id').loc[bottom].to_numpy()
+        np.testing.assert_array_equal(bottom_block, np.eye(2))
+        # Each leaf contributes to exactly its own parent chain.
+        upper_block = S_df.set_index('unique_id').loc[
+            ['COUNTRY', 'COUNTRY/x', 'COUNTRY/x%2Fy']
+        ].to_numpy()
+        np.testing.assert_array_equal(
+            upper_block,
+            np.array([[1.0, 1.0], [0.0, 1.0], [1.0, 0.0]]),
+        )
+
+
+def test_percent_values_keep_plain_names(df_with_slashes):
+    df = df_with_slashes.copy()
+    df['cat1'] = ['a%b', 'a%b']
+    Y_df, S_df, tags = aggregate(df, [['country'], ['country', 'cat1']])
+    # A percent sign on its own is unambiguous, so the historical name is kept.
+    assert tags['country'].tolist() == ['COUNTRY']
+    assert tags['country/cat1'].tolist() == ['COUNTRY/a%b']
+    assert decode_path('COUNTRY/a%b') == ['COUNTRY', 'a%b']
+    assert Y_df.query("unique_id == 'COUNTRY/a%b'")['y'].tolist() == [30.0]
+
+
+def test_escape_markers_in_values_are_escaped(df_with_slashes):
+    df = df_with_slashes.copy()
+    # These values would otherwise decode into something else.
+    df['cat1'] = ['a%2Fb', 'a%2Fb']
+    Y_df, S_df, tags = aggregate(df, [['country'], ['country', 'cat1']])
+    assert tags['country/cat1'].tolist() == ['COUNTRY/a%252Fb']
+    assert decode_path('COUNTRY/a%252Fb') == ['COUNTRY', 'a%2Fb']
+
+
+def test_slash_paths_sparse_matches_dense(df_with_slashes):
+    from hierarchicalforecast.utils import SMatrix
+
+    spec = [['country'], ['country', 'cat1'], ['country', 'cat1', 'cat2']]
+    for df in (df_with_slashes, pl.from_pandas(df_with_slashes)):
+        _, S_df, tags = aggregate(df, spec)
+        _, S_sparse, tags_sparse = aggregate(df, spec, sparse_s=True)
+
+        assert isinstance(S_sparse, SMatrix)
+        if isinstance(S_df, pl.DataFrame):
+            S_df = S_df.to_pandas()
+        assert S_sparse.row_labels.tolist() == S_df['unique_id'].tolist()
+        assert S_sparse.col_labels.tolist() == S_df.columns[1:].tolist()
+        for level in tags:
+            np.testing.assert_array_equal(tags[level], tags_sparse[level])
+        # Same path identity drives the dense and sparse representations.
+        np.testing.assert_array_equal(
+            S_sparse.to_frame(backend='pandas')
+            .drop(columns='unique_id')
+            .to_numpy(),
+            S_df.drop(columns='unique_id').to_numpy(),
+        )
+
+
+def test_encode_path_round_trip():
+    from hierarchicalforecast.utils import encode_path
+
+    cases = [
+        ['COUNTRY', 'a', 'b'],
+        ['COUNTRY', 'x/y', 'z'],
+        ['COUNTRY', 'x', 'y/z'],
+        ['a%b', 'c/d%e'],
+        ['%2F', 'a%252Fb'],
+        ['', 'a'],
+    ]
+    for parts in cases:
+        np.testing.assert_array_equal(decode_path(encode_path(parts)), parts)
+
+
+def test_decode_path_rejects_non_string():
+    with pytest.raises(TypeError, match='path must be a string'):
+        decode_path(1)
+
+
+def test_encode_path_rejects_non_string():
+    from hierarchicalforecast.utils import encode_path
+
+    with pytest.raises(TypeError, match='path components must be strings'):
+        encode_path(['a', 1])
 
 
 # Testing equivalence of other dataframe libs to pandas results.
