@@ -23,7 +23,14 @@ from hierarchicalforecast.utils import (
     set_num_threads,
 )
 
-from .probabilistic_methods import PERMBU, Bootstrap, Conformal, Normality
+from .probabilistic_methods import (
+    PERMBU,
+    Bootstrap,
+    Conformal,
+    Normality,
+    _continuous_block_starts,
+    _raise_if_no_blocks,
+)
 
 
 class HReconciler:
@@ -63,6 +70,7 @@ class HReconciler:
         num_samples,
         seed,
         tags,
+        y_dates=None,
     ):
         if intervals_method == "normality":
             sampler = Normality(S=S, P=P, y_hat=y_hat, W=W, sigmah=sigmah, seed=seed)
@@ -87,6 +95,7 @@ class HReconciler:
                 y_hat_insample=y_hat_insample,
                 num_samples=num_samples,
                 seed=seed,
+                y_dates=y_dates,
             )
         elif intervals_method == "conformal":
             sampler = Conformal(
@@ -227,6 +236,7 @@ class BottomUp(HReconciler):
         num_samples: int | None = None,
         seed: int | None = None,
         tags: dict[str, np.ndarray] | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """Bottom Up Fit Method.
 
@@ -240,6 +250,8 @@ class BottomUp(HReconciler):
             num_samples (Optional[int], optional): Number of samples for probabilistic coherent distribution. Default is None.
             seed (Optional[int], optional): Seed for reproducibility. Default is None.
             tags (Optional[dict[str, np.ndarray]], optional): Tags for hierarchical structure. Default is None.
+            y_dates (Optional[np.ndarray], optional): Insample timestamps aligned
+                with `y_insample` columns; used by bootstrap blocks. Default is None.
 
         Returns:
             BottomUp (object): fitted reconciler.
@@ -258,6 +270,7 @@ class BottomUp(HReconciler):
             num_samples=num_samples,
             seed=seed,
             tags=tags,
+            y_dates=y_dates,
         )
         self.fitted = True
         return self
@@ -274,6 +287,7 @@ class BottomUp(HReconciler):
         num_samples: int | None = None,
         seed: int | None = None,
         tags: dict[str, np.ndarray] | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """BottomUp Reconciliation Method.
 
@@ -288,6 +302,8 @@ class BottomUp(HReconciler):
             num_samples (Optional[int], optional): Number of samples for probabilistic coherent distribution. Default is None.
             seed (Optional[int], optional): Seed for reproducibility. Default is None.
             tags (Optional[dict[str, np.ndarray]], optional): Tags for hierarchical structure. Default is None.
+            y_dates (Optional[np.ndarray], optional): Insample timestamps aligned
+                with `y_insample` columns; used by bootstrap blocks. Default is None.
 
         Returns:
             y_tilde (dict): Reconciliated y_hat using the Bottom Up approach.
@@ -303,6 +319,7 @@ class BottomUp(HReconciler):
             num_samples=num_samples,
             seed=seed,
             tags=tags,
+            y_dates=y_dates,
         )
 
         return self._reconcile(
@@ -401,12 +418,19 @@ def _reconcile_fcst_proportions_bootstrap(
     nodes: dict[str, dict[int, np.ndarray]] | None = None,
     idxs_top: np.ndarray | None = None,
     A: sparse.csr_matrix | None = None,
+    y_dates: np.ndarray | None = None,
 ):
     """Generate prediction intervals for forecast_proportions using bootstrap.
 
     This function generates bootstrap samples by adding resampled residuals to
     the base forecasts, then reconciles each sample using forecast proportions.
     Supports both dense and sparse summing matrices.
+
+    Residual blocks are drawn exclusively from continuous, jointly-observed
+    windows of the residual history: a window never spans a column with NaN
+    residuals nor, when ``y_dates`` is provided, a real-time reporting gap.
+    Windows whose length equals the horizon are allowed; if none fits, a
+    ``ValueError`` reports the required span.
 
     Args:
         S: Summing matrix of size (`base`, `bottom`). Can be dense or sparse.
@@ -420,6 +444,8 @@ def _reconcile_fcst_proportions_bootstrap(
         nodes: Child nodes structure from _get_child_nodes (required for dense S).
         idxs_top: Indices of top-level nodes (required for dense S).
         A: Adjacency matrix (required for sparse S).
+        y_dates: Optional insample timestamps of size (`insample_size`,), used
+            to keep resampled blocks inside continuous real-time windows.
 
     Returns:
         quantiles: Array of shape (`base`, `horizon`, `num_quantiles`).
@@ -430,15 +456,18 @@ def _reconcile_fcst_proportions_bootstrap(
     residuals = y_insample - y_hat_insample
     h = y_hat.shape[1]
 
-    # Remove NaN columns from residuals
-    residuals = residuals[:, np.isnan(residuals).sum(axis=0) == 0]
+    # Block starts reference the original (uncompressed) time axis, so dates on
+    # the two sides of a missing report can never be stitched into one block.
+    block_starts = _continuous_block_starts(
+        residuals=residuals, block_length=h, y_dates=y_dates
+    )
+    if block_starts.size == 0:
+        _raise_if_no_blocks(block_length=h, residuals=residuals, y_dates=y_dates)
 
-    # Get valid sample indices
-    sample_idx = np.arange(residuals.shape[1] - h)
     rng = np.random.default_rng(seed)
 
     # Generate bootstrap samples
-    samples_idx = rng.choice(sample_idx, size=num_samples)
+    samples_idx = rng.choice(block_starts, size=num_samples)
     bootstrap_samples = []
 
     for idx in samples_idx:
@@ -630,6 +659,7 @@ class TopDown(HReconciler):
         num_samples: int | None = None,
         seed: int | None = None,
         tags: dict[str, np.ndarray] | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """TopDown Fit Method.
 
@@ -643,6 +673,8 @@ class TopDown(HReconciler):
             num_samples (int): Number of samples for probabilistic coherent distribution.
             seed (int): Seed for reproducibility.
             tags (dict[str, np.ndarray]): Each key is a level and each value its `S` indices.
+            y_dates (Optional[np.ndarray]): Insample timestamps aligned with
+                `y_insample` columns; used by bootstrap blocks.
 
         Returns:
             TopDown (object): fitted reconciler.
@@ -663,6 +695,7 @@ class TopDown(HReconciler):
             num_samples=num_samples,
             seed=seed,
             tags=tags,
+            y_dates=y_dates,
         )
         self.fitted = True
         return self
@@ -679,6 +712,7 @@ class TopDown(HReconciler):
         intervals_method: str | None = None,
         num_samples: int | None = None,
         seed: int | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """Top Down Reconciliation Method.
 
@@ -692,7 +726,9 @@ class TopDown(HReconciler):
             level (list[int]): float list 0-100, confidence levels for prediction intervals. Default is None.
             intervals_method (str): Sampler for prediction intervals, one of `normality`, `bootstrap`, `permbu`, `conformal`. Default is None.
             num_samples (int): Number of samples for probabilistic coherent distribution. Default is None.
-            seed (int): Seed for reproducibility.
+            seed (int): Seed for reproducibility. Default is None.
+            y_dates (Optional[np.ndarray]): Insample timestamps aligned with
+                `y_insample` columns; used by bootstrap blocks.
 
         Returns:
             y_tilde (np.ndarray): Reconciliated y_hat using the Top Down approach.
@@ -752,6 +788,7 @@ class TopDown(HReconciler):
                     level=level,
                     nodes=nodes,
                     idxs_top=idxs_top,
+                    y_dates=y_dates,
                 )
             return res
         else:
@@ -766,6 +803,7 @@ class TopDown(HReconciler):
                 num_samples=num_samples,
                 seed=seed,
                 tags=tags,
+                y_dates=y_dates,
             )
             return self._reconcile(
                 S=S, P=self.P, y_hat=y_hat, level=level, sampler=self.sampler
@@ -850,6 +888,7 @@ class TopDownSparse(TopDown):
         intervals_method: str | None = None,
         num_samples: int | None = None,
         seed: int | None = None,
+        y_dates: np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
         if self.method == "forecast_proportions":
             # Construct the adjacency matrix.
@@ -896,6 +935,7 @@ class TopDownSparse(TopDown):
                     seed=seed,
                     level=level,
                     A=A,
+                    y_dates=y_dates,
                 )
             return res
         else:
@@ -910,6 +950,7 @@ class TopDownSparse(TopDown):
                 num_samples=num_samples,
                 seed=seed,
                 tags=tags,
+                y_dates=y_dates,
             )
             return self._reconcile(
                 S=S, P=self.P, y_hat=y_hat, level=level, sampler=self.sampler
@@ -975,6 +1016,7 @@ class MiddleOut(HReconciler):
         intervals_method: str | None = None,
         num_samples: int | None = None,
         seed: int | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """Middle Out Reconciliation Method.
 
@@ -989,6 +1031,8 @@ class MiddleOut(HReconciler):
             intervals_method (str): Sampler for prediction intervals, one of `normality`, `bootstrap`, `permbu`, `conformal`. Default is None.
             num_samples (int): Number of samples for probabilistic coherent distribution. Default is None.
             seed (int): Seed for reproducibility. Default is None.
+            y_dates (Optional[np.ndarray]): Insample timestamps aligned with
+                `y_insample` columns; used by bootstrap blocks.
 
         Returns:
             y_tilde: Reconciliated y_hat using the Middle Out approach.
@@ -1030,6 +1074,7 @@ class MiddleOut(HReconciler):
             num_samples=num_samples,
             seed=seed,
             tags=tags_bu,
+            y_dates=y_dates,
         )
         y_tilde[:cut_idx] = bu["mean"]
         if level is not None:
@@ -1088,6 +1133,7 @@ class MiddleOut(HReconciler):
                 num_samples=num_samples,
                 seed=seed,
                 tags=sub_tags,
+                y_dates=y_dates,
             )
             y_tilde[sub_idx] = td_node["mean"]
             if level is not None and y_tilde_quantiles is not None:
@@ -1128,6 +1174,7 @@ class MiddleOutSparse(MiddleOut):
         intervals_method: str | None = None,
         num_samples: int | None = None,
         seed: int | None = None,
+        y_dates: np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
         # Check if the middle level exists in the level to nodes mapping.
         if self.middle_level not in tags.keys():
@@ -1171,6 +1218,7 @@ class MiddleOutSparse(MiddleOut):
             num_samples=num_samples,
             seed=seed,
             tags=tags_bu,
+            y_dates=y_dates,
         )
         y_tilde[:cut_idx] = bu_sparse["mean"]
         if level is not None:
@@ -1229,6 +1277,7 @@ class MiddleOutSparse(MiddleOut):
                 num_samples=num_samples,
                 seed=seed,
                 tags=sub_tags,
+                y_dates=y_dates,
             )
             y_tilde[sub_idx] = td_node["mean"]
             if level is not None and y_tilde_quantiles is not None:
@@ -1489,6 +1538,7 @@ class MinTrace(HReconciler):
         num_samples: int | None = None,
         seed: int | None = None,
         tags: dict[str, np.ndarray] | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """MinTrace Fit Method.
 
@@ -1502,6 +1552,8 @@ class MinTrace(HReconciler):
             num_samples: Number of samples for probabilistic coherent distribution.
             seed: Seed for reproducibility.
             tags: Each key is a level and each value its `S` indices.
+            y_dates: Insample timestamps aligned with `y_insample` columns;
+                used by bootstrap blocks.
 
         Returns:
             self: object, fitted reconciler.
@@ -1570,6 +1622,7 @@ class MinTrace(HReconciler):
             num_samples=num_samples,
             seed=seed,
             tags=tags,
+            y_dates=y_dates,
         )
         self.fitted = True
         return self
@@ -1586,6 +1639,7 @@ class MinTrace(HReconciler):
         num_samples: int | None = None,
         seed: int | None = None,
         tags: dict[str, np.ndarray] | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """MinTrace Reconciliation Method.
 
@@ -1621,6 +1675,7 @@ class MinTrace(HReconciler):
             num_samples=num_samples,
             seed=seed,
             tags=tags,
+            y_dates=y_dates,
         )
 
         return self._reconcile(
@@ -1764,6 +1819,7 @@ class MinTraceSparse(MinTrace):
         num_samples: int | None = None,
         seed: int | None = None,
         tags: dict[str, np.ndarray] | None = None,
+        y_dates: np.ndarray | None = None,
     ) -> "MinTraceSparse":
         """MinTraceSparse Fit Method.
 
@@ -1777,6 +1833,8 @@ class MinTraceSparse(MinTrace):
             num_samples: Number of samples for probabilistic coherent distribution.
             seed: Seed for reproducibility.
             tags: Each key is a level and each value its `S` indices.
+            y_dates: Insample timestamps aligned with `y_insample` columns;
+                used by bootstrap blocks.
 
         Returns:
             self: object, fitted reconciler.
@@ -1947,6 +2005,7 @@ class MinTraceSparse(MinTrace):
             num_samples=num_samples,
             seed=seed,
             tags=tags,
+            y_dates=y_dates,
         )
         # Set the instance as fitted.
         self.fitted = True
@@ -2113,6 +2172,7 @@ class ERM(HReconciler):
         num_samples: int | None = None,
         seed: int | None = None,
         tags: dict[str, np.ndarray] | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """ERM Fit Method.
 
@@ -2126,6 +2186,8 @@ class ERM(HReconciler):
             num_samples: Number of samples for probabilistic coherent distribution.
             seed: Seed for reproducibility.
             tags: Each key is a level and each value its `S` indices.
+            y_dates: Insample timestamps aligned with `y_insample` columns;
+                used by bootstrap blocks.
 
         Returns:
             self: object, fitted reconciler.
@@ -2148,6 +2210,7 @@ class ERM(HReconciler):
             num_samples=num_samples,
             seed=seed,
             tags=tags,
+            y_dates=y_dates,
         )
         self.fitted = True
         return self
@@ -2164,6 +2227,7 @@ class ERM(HReconciler):
         num_samples: int | None = None,
         seed: int | None = None,
         tags: dict[str, np.ndarray] | None = None,
+        y_dates: np.ndarray | None = None,
     ):
         """ERM Reconciliation Method.
 
@@ -2193,6 +2257,7 @@ class ERM(HReconciler):
             num_samples=num_samples,
             seed=seed,
             tags=tags,
+            y_dates=y_dates,
         )
 
         return self._reconcile(

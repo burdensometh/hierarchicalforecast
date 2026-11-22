@@ -656,6 +656,14 @@ class HierarchicalReconciliation:
                 target_col=target_col,
             )
             reconciler_args["y_insample"] = y_insample
+            # Real insample timestamps, aligned with the columns of y_insample.
+            # The block bootstrap uses them to keep resampled windows inside
+            # continuous history, so dates around a reporting gap are never
+            # stitched into one block. Y_nw is sorted by series then time and
+            # every series shares the same timeline, so one unique() suffices.
+            reconciler_args["y_dates"] = (
+                Y_nw[time_col].unique().sort().to_numpy()
+            )
 
         # Check if any reconciler requires a strictly hierarchical structure (fail fast)
         # Single traversal to collect all strict reconcilers

@@ -17,6 +17,166 @@ from .utils import (
 )
 
 
+def _continuous_segments(
+    valid: np.ndarray, break_before: np.ndarray
+) -> list[tuple[int, int]]:
+    """Split period indices into maximal continuous segments.
+
+    A period starts a new segment when it is not jointly observed (``valid``
+    is False) or when a real-time reporting gap sits immediately before it
+    (``break_before`` is True). Invalid periods are skipped rather than
+    compressing the time axis, so all returned indices keep their alignment
+    with the original (uncompressed) residual columns.
+
+    Args:
+        valid: Boolean array of size (`n_periods`,), True for periods jointly
+            observed (no NaN residual) across every series.
+        break_before: Boolean array of size (`n_periods`,), True for periods
+            preceded by a gap in the timestamp sequence.
+
+    Returns:
+        list[tuple[int, int]]: Half-open ``[start, end)`` segment index ranges.
+    """
+    n_periods = valid.shape[0]
+    segments: list[tuple[int, int]] = []
+    start: int | None = None
+    for idx in range(n_periods):
+        if not valid[idx]:
+            if start is not None:
+                segments.append((start, idx))
+                start = None
+        elif start is None:
+            start = idx
+        elif break_before[idx]:
+            segments.append((start, idx))
+            start = idx
+    if start is not None:
+        segments.append((start, n_periods))
+    return segments
+
+
+def _gap_break_before(y_dates: np.ndarray, n_periods: int) -> np.ndarray:
+    """Mark periods preceded by a real-time gap relative to the native frequency."""
+    y_dates = np.asarray(y_dates)
+    if y_dates.shape[0] != n_periods:
+        raise ValueError(
+            f"y_dates has {y_dates.shape[0]} timestamps but residuals have "
+            f"{n_periods} periods; they must be aligned."
+        )
+    if np.issubdtype(y_dates.dtype, np.datetime64):
+        # Native integer step on the timeline's own unit; weekly data that
+        # skips a week then shows a step of 2, daily data a step of 2, etc.
+        timeline = y_dates.astype("datetime64[ns]").astype(np.int64)
+    else:
+        timeline = y_dates.astype(np.float64, copy=False)
+    deltas = np.diff(timeline)
+    positive_deltas = deltas[np.isfinite(deltas) & (deltas > 0)]
+    if positive_deltas.size == 0:
+        raise ValueError(
+            "Cannot infer the data frequency from y_dates: at least two "
+            "distinct ordered timestamps are required."
+        )
+    freq = positive_deltas.min()
+    break_before = np.zeros(n_periods, dtype=bool)
+    # A step larger than the native frequency is a reporting gap. The boundary
+    # sits between columns i and i+1, so column i+1 starts a new segment.
+    break_before[1:] = deltas > freq
+    return break_before
+
+
+def _continuous_block_starts(
+    residuals: np.ndarray,
+    block_length: int,
+    y_dates: np.ndarray | None = None,
+) -> np.ndarray:
+    """Find start indices of residual blocks lying inside continuous history.
+
+    A block is selectable only when:
+
+    1. Every residual column it spans is jointly observed, i.e. no series has
+       a missing (NaN) residual at any of the block's timestamps.
+    2. When ``y_dates`` is provided, the timestamps it spans are contiguous in
+       real time. Timestamps on the two sides of a reporting gap are therefore
+       never stitched into the same block, even when the gap leaves no NaN
+       behind (e.g. an entire missing week across every series).
+
+    Columns are indexed against the original (uncompressed) residual array, so
+    blocks keep their real temporal alignment. A block is allowed to use the
+    full history, i.e. ``block_length`` equal to the length of a continuous
+    segment yields a single selectable block.
+
+    Args:
+        residuals: Residuals of size (`n_series`, `n_periods`). NaN marks a
+            missing/non-jointly-observed period for that series.
+        block_length: Length ``h`` of each block (the forecast horizon).
+        y_dates: Optional timestamps of size (`n_periods`,), aligned with the
+            residual columns. Gaps are detected from non-unit steps relative
+            to the series' native frequency.
+
+    Returns:
+        np.ndarray: Global column indices at which a valid length-``h`` block
+            starts. Empty when no block fits, callers decide how to report it.
+    """
+    n_periods = residuals.shape[1]
+    if block_length <= 0:
+        raise ValueError(
+            f"Block length must be positive, got {block_length}."
+        )
+
+    # Periods jointly observed across every series. Missing reports for any
+    # series break the block but do not compress the time axis.
+    valid = ~np.isnan(residuals).any(axis=0)
+    break_before = (
+        _gap_break_before(y_dates, n_periods)
+        if y_dates is not None
+        else np.zeros(n_periods, dtype=bool)
+    )
+
+    # Enumerate every length-block_length window that fits inside a segment.
+    # A segment of exactly block_length periods contributes one window.
+    starts = []
+    for segment_start, segment_end in _continuous_segments(valid, break_before):
+        segment_size = segment_end - segment_start
+        if segment_size >= block_length:
+            starts.extend(
+                range(segment_start, segment_end - block_length + 1)
+            )
+    return np.asarray(starts, dtype=np.int64)
+
+
+def _raise_if_no_blocks(
+    block_length: int,
+    residuals: np.ndarray,
+    y_dates: np.ndarray | None = None,
+) -> None:
+    """Report the history span required when no continuous block is available."""
+    n_periods = residuals.shape[1]
+    valid = ~np.isnan(residuals).any(axis=0)
+    break_before = (
+        _gap_break_before(y_dates, n_periods)
+        if y_dates is not None
+        else np.zeros(n_periods, dtype=bool)
+    )
+    longest = max(
+        (end - start for start, end in _continuous_segments(valid, break_before)),
+        default=0,
+    )
+    date_msg = ""
+    if y_dates is not None:
+        date_msg = (
+            " Reporting gaps in `y_dates` further split the history; windows "
+            "cannot cross the missing periods on either side of a gap."
+        )
+    raise ValueError(
+        f"No continuous residual window of length {block_length} is available "
+        f"for block bootstrap. The jointly-observed residual history contains "
+        f"{n_periods} periods in total and its longest continuous segment has "
+        f"{longest} period(s). At least {block_length} consecutive, jointly "
+        f"observed periods (a span of {block_length} timestamps without "
+        f"missing reports) are required." + date_msg
+    )
+
+
 class CovarianceType(str, Enum):
     """Covariance estimation method for Normality probabilistic reconciliation.
 
@@ -533,6 +693,12 @@ class Bootstrap:
         y_hat_insample: Insample point forecasts of size (`base`, `insample_size`).
         num_samples: int, number of bootstraped samples generated.
         seed: int, random seed for numpy generator's replicability.
+        y_dates: Optional timestamps of size (`insample_size`,), aligned with
+            the columns of ``y_insample`` and ``y_hat_insample``. When given,
+            moving blocks are restricted to continuous real-time windows, so
+            dates on either side of a reporting gap (e.g. a missing week) are
+            never stitched into the same block. When None, blocks only avoid
+            columns containing NaN residuals and assume contiguous history.
 
     References:
         - [Puwasala Gamakumara Ph. D. dissertation. Monash University, Econometrics and Business Statistics (2020). "Probabilistic Forecast Reconciliation"](https://bridges.monash.edu/articles/thesis/Probabilistic_Forecast_Reconciliation_Theory_and_Applications/11869533)
@@ -549,6 +715,7 @@ class Bootstrap:
         num_samples: int = 100,
         seed: int = 0,
         W: np.ndarray | sp.spmatrix = None,
+        y_dates: np.ndarray | None = None,
     ):
         self.S = S
         self.P = P
@@ -558,12 +725,20 @@ class Bootstrap:
         self.y_hat_insample = y_hat_insample
         self.num_samples = num_samples
         self.seed = seed
+        self.y_dates = y_dates
 
     def get_samples(self, num_samples: int):
         """Bootstrap Sample Reconciliation Method.
 
         Applies Bootstrap sample reconciliation method as defined by Gamakumara 2020.
         Generating independent sample paths and reconciling them with Bootstrap.
+
+        Residual blocks are drawn from continuous, jointly-observed windows of
+        the residual history. Windows never span a reporting gap: columns with
+        NaN residuals break a window, and when ``y_dates`` is available a
+        non-contiguous timestamp step breaks one too. A window whose length
+        equals the forecast horizon is selectable; if no window fits, a
+        ``ValueError`` reports the span required by the horizon.
 
         Args:
             num_samples: int, number of samples generated from coherent distribution.
@@ -574,11 +749,22 @@ class Bootstrap:
         residuals = self.y_insample - self.y_hat_insample
         h = self.y_hat.shape[1]
 
-        # removing nas from residuals
-        residuals = residuals[:, np.isnan(residuals).sum(axis=0) == 0]
-        sample_idx = np.arange(residuals.shape[1] - h)
+        # Selectable blocks keep their original (uncompressed) time indices, so
+        # the two sides of a missing report can never be joined in one window.
+        block_starts = _continuous_block_starts(
+            residuals=residuals,
+            block_length=h,
+            y_dates=self.y_dates,
+        )
+        if block_starts.size == 0:
+            _raise_if_no_blocks(
+                block_length=h,
+                residuals=residuals,
+                y_dates=self.y_dates,
+            )
+
         rng = np.random.default_rng(self.seed)
-        samples_idx = rng.choice(sample_idx, size=num_samples)
+        samples_idx = rng.choice(block_starts, size=num_samples)
         samples = [self.y_hat + residuals[:, idx : (idx + h)] for idx in samples_idx]
         SP = self.S @ self.P
         samples = np.apply_along_axis(lambda path: SP @ path, axis=1, arr=samples)
