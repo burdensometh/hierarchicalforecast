@@ -15,6 +15,7 @@ from hierarchicalforecast.methods import (
     ERM,
     BottomUp,
     BottomUpSparse,
+    IntegerReconciliation,
     MiddleOut,
     MiddleOutSparse,
     MinTrace,
@@ -1397,3 +1398,157 @@ def test_smatrix_revalidates_bottom_identity_after_sparse_matrix_is_exposed():
     sparse_matrix.data[0] = 0.0
 
     assert not smat.check_bottom_identity()
+
+
+@pytest.fixture
+def integer_release_data():
+    """Synthetic strictly hierarchical data in pandas and polars."""
+    structure = [
+        ("AU", "NSW", "Sydney"),
+        ("AU", "NSW", "Newcastle"),
+        ("AU", "VIC", "Melbourne"),
+        ("AU", "VIC", "Geelong"),
+    ]
+    rng = np.random.default_rng(7)
+    rows = [
+        {
+            "Country": country,
+            "State": state,
+            "Region": region,
+            "ds": ds,
+            "y": float(rng.integers(1, 20)),
+        }
+        for country, state, region in structure
+        for ds in pd.date_range("2020-01-01", periods=8, freq="MS")
+    ]
+    df = pd.DataFrame(rows)
+    Y_df, S_df, tags = aggregate(
+        df, [["Country"], ["Country", "State"], ["Country", "State", "Region"]]
+    )
+    Y_df["y_model"] = Y_df["y"] + 0.4
+
+    return {
+        "pandas": {
+            "Y_df": Y_df,
+            "S_df": S_df,
+            "tags": tags,
+        },
+        "polars": {
+            "Y_df": pl.from_pandas(Y_df),
+            "S_df": pl.from_pandas(S_df),
+            "tags": tags,
+        },
+    }
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_integer_reconciliation_release_in_reconcile(integer_release_data, lib):
+    """Whole-unit releases flow through `HierarchicalReconciliation.reconcile`.
+
+    The published column must be coherent non-negative integers, and the root
+    must preserve its rounded coordinated total.
+    """
+    data = integer_release_data[lib]
+    Y_hat, S, tags = data["Y_df"], data["S_df"], data["tags"]
+
+    hrec = HierarchicalReconciliation([BottomUp(), IntegerReconciliation()])
+    reconciled = hrec.reconcile(Y_hat_df=Y_hat, S_df=S, tags=tags, diagnostics=True)
+
+    result = nw.from_native(reconciled)
+    col = "y_model/IntegerReconciliation"
+    assert col in result.columns
+
+    values = result[col].to_numpy()
+    np.testing.assert_array_equal(values, np.rint(values))
+    assert np.all(values >= 0)
+
+    # Bottom block is coherent with every aggregate. Rows are stored series-major.
+    S_np = nw.from_native(S).select(nw.exclude("unique_id")).to_numpy()
+    n_series, n_bottom = S_np.shape
+    values_2d = values.reshape(n_series, -1)
+    np.testing.assert_array_equal(values_2d, S_np @ values_2d[-n_bottom:])
+
+    # The root keeps the rounded coordinated total (half up).
+    base_root = nw.from_native(Y_hat).filter(
+        nw.col("unique_id") == result["unique_id"][0]
+    )["y_model"].to_numpy()
+    np.testing.assert_array_equal(
+        values_2d[0], np.floor(base_root + 0.5).astype(np.int64)
+    )
+
+    diag = nw.from_native(hrec.diagnostics)
+    coherent = diag.filter(
+        (nw.col("metric") == "is_coherent") & (nw.col("level") == "Overall")
+    )[col].to_list()[0]
+    assert coherent == 1.0
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_integer_reconciliation_two_stage_release(integer_release_data, lib):
+    """Coordinated forecasts can be rounded in a second publishing pass."""
+    data = integer_release_data[lib]
+    Y_hat, S, tags = data["Y_df"], data["S_df"], data["tags"]
+
+    # Stage 1: coordinate with BottomUp.
+    coordinated = HierarchicalReconciliation([BottomUp()]).reconcile(
+        Y_hat_df=Y_hat, S_df=S, tags=tags
+    )
+    coordinated_nw = nw.from_native(coordinated)
+
+    # Stage 2: publish whole units from the coordinated matrix.
+    release_input = coordinated_nw.select(
+        "unique_id", "ds", nw.col("y_model/BottomUp").alias("model")
+    )
+    if lib == "polars":
+        release_input = release_input.to_native()
+    released = HierarchicalReconciliation([IntegerReconciliation()]).reconcile(
+        Y_hat_df=release_input, S_df=S, tags=tags
+    )
+    released_nw = nw.from_native(released)
+    values = released_nw["model/IntegerReconciliation"].to_numpy()
+
+    np.testing.assert_array_equal(values, np.rint(values))
+    assert np.all(values >= 0)
+
+    S_np = nw.from_native(S).select(nw.exclude("unique_id")).to_numpy()
+    n_series, n_bottom = S_np.shape
+    values_2d = values.reshape(n_series, -1)
+    np.testing.assert_array_equal(values_2d, S_np @ values_2d[-n_bottom:])
+
+    # The root keeps its rounded coordinated total. Intermediate nodes are
+    # rebuilt from the rounded leaves, so they may move by one unit while
+    # staying coherent.
+    coordinated_values = coordinated_nw[
+        "y_model/BottomUp"
+    ].to_numpy().reshape(n_series, -1)
+    np.testing.assert_array_equal(
+        values_2d[0], np.floor(coordinated_values[0] + 0.5).astype(np.int64)
+    )
+    assert values_2d[0].sum() == values_2d[-n_bottom:].sum()
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_integer_reconciliation_rejects_grouped_in_reconcile(lib):
+    """Grouped structures with several roots are explained, not silently rounded."""
+    rows = [
+        {"City": city, "Segment": segment, "ds": ds, "y": float(v)}
+        for city, segment, v in [
+            ("A", "X", 3.0),
+            ("A", "Y", 4.0),
+            ("B", "X", 5.0),
+            ("B", "Y", 6.0),
+        ]
+        for ds in pd.date_range("2020-01-01", periods=4, freq="MS")
+    ]
+    df = pd.DataFrame(rows)
+    if lib == "polars":
+        df = pl.from_pandas(df)
+    Y_df, S_df, tags = aggregate(df, [["City"], ["Segment"], ["City", "Segment"]])
+    if lib == "polars":
+        Y_df = Y_df.with_columns(pl.col("y").alias("y_model"))
+    else:
+        Y_df = Y_df.assign(y_model=Y_df["y"])
+
+    hrec = HierarchicalReconciliation([IntegerReconciliation()])
+    with pytest.raises(ValueError, match="strictly hierarchical"):
+        hrec.reconcile(Y_hat_df=Y_df, S_df=S_df, tags=tags)

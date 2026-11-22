@@ -11,7 +11,7 @@
 [![conda-nixtla](https://img.shields.io/conda/vn/conda-forge/hierarchicalforecast?color=seagreen&label=conda)](https://anaconda.org/conda-forge/hierarchicalforecast)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/Nixtla/hierarchicalforecast/blob/main/LICENSE)
 
-**HierarchicalForecast** offers a collection of cross-sectional and temporal reconciliation methods, including `BottomUp`, `TopDown`, `MiddleOut`, `MinTrace` and `ERM`, as well as probabilistic coherent prediction methods such as `Normality`, `Bootstrap`, and `PERMBU`.
+**HierarchicalForecast** offers a collection of cross-sectional and temporal reconciliation methods, including `BottomUp`, `TopDown`, `MiddleOut`, `MinTrace` and `ERM`, as well as probabilistic coherent prediction methods such as `Normality`, `Bootstrap`, and `PERMBU`. It also includes `IntegerReconciliation` to publish coordinated forecasts as whole units while preserving approved aggregate totals.
 </div>
 
 ## 📚 Intro
@@ -26,6 +26,8 @@ A vast number of time series datasets are organized into structures with differe
     - `MiddleOut`: It anchors the base predictions in a middle level. The levels above the base predictions use the bottom-up approach, while the levels below use a top-down.
     - `MinTrace`: Minimizes the total forecast variance of the space of coherent forecasts, with the Minimum Trace reconciliation.
     - `ERM`: Optimizes the reconciliation matrix minimizing an L1 regularized objective.
+* Publication methods:
+    - `IntegerReconciliation`: Rounds coordinated leaf forecasts to non-negative whole units, preserves each root's approved total, and rebuilds intermediate nodes.
 * Probabilistic coherent methods:
     - `Normality`: Uses MinTrace variance-covariance closed form matrix under a normality assumption.
     - `Bootstrap`: Generates distribution of hierarchically reconciled predictions using Gamakumara's bootstrap approach.

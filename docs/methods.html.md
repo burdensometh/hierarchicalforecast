@@ -227,6 +227,27 @@ test_fail(
       show_root_heading: true
       show_source: true
 
+## 7. Whole-Unit Releases
+
+Replenishment orders often have to be published in complete cases, while the
+approved aggregate (for example a regional total) must stay exactly as planned.
+`IntegerReconciliation` turns already coordinated forecasts into non-negative
+whole units: each root keeps its whole-unit total, the total is allocated across
+its leaves with the largest-remainder rule (ties broken in leaf order), and every
+intermediate node is recomputed as the sum of its leaves.
+
+::: hierarchicalforecast.methods.IntegerReconciliation
+    handler: python
+    options:
+      docstring_style: google
+      members:
+        - fit
+        - predict
+        - fit_predict
+      heading_level: 3
+      show_root_heading: true
+      show_source: true
+
 ## References
 
 ### General Reconciliation

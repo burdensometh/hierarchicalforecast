@@ -7,6 +7,7 @@ from scipy import sparse
 from hierarchicalforecast.methods import (
     ERM,
     BottomUp,
+    IntegerReconciliation,
     MiddleOut,
     MiddleOutSparse,
     MinTrace,
@@ -16,6 +17,7 @@ from hierarchicalforecast.methods import (
     TopDownSparse,
     _is_strictly_hierarchical,
     is_strictly_hierarchical,
+    publish_whole_units,
 )
 from hierarchicalforecast.utils import _construct_adjacency_matrix
 
@@ -510,6 +512,441 @@ def test_erm_forecast_recovery(hierarchical_data):
     )["mean"]
 
     np.testing.assert_allclose(result, data.S @ data.y_hat_bottom)
+
+
+# --------------------------------------------------------------------------- #
+# IntegerReconciliation (whole-unit releases)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def integer_forest_data():
+    """A two-root forest where each root owns two bottom series."""
+    S = np.array(
+        [
+            [1.0, 1.0, 0.0, 0.0],  # Root A
+            [0.0, 0.0, 1.0, 1.0],  # Root B
+            [1.0, 0.0, 0.0, 0.0],  # A1
+            [0.0, 1.0, 0.0, 0.0],  # A2
+            [0.0, 0.0, 1.0, 0.0],  # B1
+            [0.0, 0.0, 0.0, 1.0],  # B2
+        ]
+    )
+    tags = {"roots": np.array([0, 1]), "bottom": np.array([2, 3, 4, 5])}
+    return S, tags
+
+
+def test_integer_reconciliation_coherent_whole_units(hierarchical_data):
+    """Leaves become non-negative integers and aggregates are recomputed."""
+    data = hierarchical_data
+    y_hat = np.array(
+        [
+            [10.4, 7.7],
+            [5.2, 3.6],
+            [5.2, 4.1],
+            [2.7, 1.1],
+            [2.5, 2.5],
+            [2.6, 2.2],
+            [2.6, 1.9],
+        ]
+    )
+    result = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)["mean"]
+
+    assert np.issubdtype(result.dtype, np.integer)
+    assert np.all(result >= 0), "whole-unit releases must be non-negative"
+    # Coherence: every row equals the sum of its leaves.
+    np.testing.assert_array_equal(result, data.S @ result[-4:])
+    # The root keeps the rounded coordinated total (half up).
+    np.testing.assert_array_equal(result[0], np.floor(y_hat[0] + 0.5).astype(int))
+
+
+def test_integer_reconciliation_zero_total(hierarchical_data):
+    """A zero root total releases zero units to every leaf below it."""
+    data = hierarchical_data
+    y_hat = np.zeros((data.S.shape[0], 2))
+    y_hat[-4:] = [[0.4, 0.0], [0.3, 0.0], [0.2, 0.0], [0.1, 0.0]]
+
+    result = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)["mean"]
+
+    np.testing.assert_array_equal(result, np.zeros_like(result))
+    assert np.issubdtype(result.dtype, np.integer)
+
+
+def test_integer_reconciliation_positive_total_zero_leaf_weights(hierarchical_data):
+    """A positive root total with all-zero leaf weights is split evenly."""
+    data = hierarchical_data
+    y_hat = np.array(
+        [
+            [9.0],
+            [4.0],
+            [5.0],
+            [0.0],
+            [0.0],
+            [0.0],
+            [0.0],
+        ]
+    )
+    result = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)["mean"]
+
+    leaves = result[-4:, 0]
+    assert leaves.sum() == 9
+    # Even split, remainder to the earliest leaves (stable tie-break).
+    np.testing.assert_array_equal(leaves, np.array([3, 2, 2, 2]))
+    np.testing.assert_array_equal(result[0], [9])
+    np.testing.assert_array_equal(result, data.S @ result[-4:])
+
+
+def test_integer_reconciliation_stable_ordering_breaks_ties(hierarchical_data):
+    """Equal fractional remainders are assigned in ascending leaf order."""
+    data = hierarchical_data
+    # All four leaves share equal weights; total 2 -> first two leaves get a unit.
+    y_hat = np.array([[2.0], [1.0], [1.0], [1.0], [1.0], [1.0], [1.0]])
+    result = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)["mean"]
+    np.testing.assert_array_equal(result[-4:, 0], np.array([1, 1, 0, 0]))
+
+    # Deterministic across repeated calls.
+    again = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)["mean"]
+    np.testing.assert_array_equal(result, again)
+
+
+def test_integer_reconciliation_forest_preserves_each_root(integer_forest_data):
+    """Each root of a forest keeps its own approved total."""
+    S, tags = integer_forest_data
+    y_hat = np.array(
+        [
+            [7.6, 4.4],
+            [2.4, 5.0],
+            [5.1, 3.2],
+            [2.5, 1.2],
+            [1.3, 2.0],
+            [1.1, 3.0],
+        ]
+    )
+    result = IntegerReconciliation()(S=S, y_hat=y_hat, tags=tags)["mean"]
+
+    assert np.issubdtype(result.dtype, np.integer)
+    assert np.all(result >= 0)
+    np.testing.assert_array_equal(result, S @ result[-4:])
+    np.testing.assert_array_equal(result[:2], np.floor(y_hat[:2] + 0.5).astype(int))
+
+
+def test_integer_reconciliation_approved_totals(integer_forest_data):
+    """Approved whole-unit totals override the rounded root forecast."""
+    S, tags = integer_forest_data
+    y_hat = np.array(
+        [
+            [7.6, 4.4],
+            [2.4, 5.0],
+            [5.1, 3.2],
+            [2.5, 1.2],
+            [1.3, 2.0],
+            [1.1, 3.0],
+        ]
+    )
+    approved = {0: [8, 3], 1: 4}
+    result = IntegerReconciliation()(
+        S=S, y_hat=y_hat, tags=tags, approved_totals=approved
+    )["mean"]
+
+    np.testing.assert_array_equal(result[0], [8, 3])
+    np.testing.assert_array_equal(result[1], [4, 4])
+    np.testing.assert_array_equal(result, S @ result[-4:])
+
+
+def test_integer_reconciliation_rejects_invalid_approved_totals(
+    integer_forest_data,
+):
+    """Approved totals must be non-negative integers on valid root nodes."""
+    S, tags = integer_forest_data
+    y_hat = np.ones((S.shape[0], 2))
+    reconciler = IntegerReconciliation()
+
+    with pytest.raises(ValueError, match="not a root"):
+        reconciler(S=S, y_hat=y_hat, tags=tags, approved_totals={4: 1})
+    with pytest.raises(ValueError, match="non-negative whole numbers"):
+        reconciler(S=S, y_hat=y_hat, tags=tags, approved_totals={0: -1})
+    with pytest.raises(ValueError, match="non-negative whole numbers"):
+        reconciler(S=S, y_hat=y_hat, tags=tags, approved_totals={0: 1.5})
+    with pytest.raises(ValueError, match="scalar or a sequence"):
+        reconciler(S=S, y_hat=y_hat, tags=tags, approved_totals={0: [1, 2, 3]})
+
+
+def test_integer_reconciliation_flat_hierarchy():
+    """A hierarchy without aggregates simply rounds the bottom series."""
+    S = np.eye(3)
+    tags = {"bottom": np.array([0, 1, 2])}
+    y_hat = np.array([[2.4], [2.4], [2.2]])
+    result = IntegerReconciliation()(S=S, y_hat=y_hat, tags=tags)["mean"]
+    np.testing.assert_array_equal(result, np.array([[2], [2], [2]]))
+
+
+def test_integer_reconciliation_rejects_shared_roots():
+    """Multiple roots that share leaves cannot preserve every root total."""
+    S = np.array(
+        [
+            [1.0, 1.0, 0.0, 0.0],  # Group by city A (shares leaves)
+            [0.0, 0.0, 1.0, 1.0],  # Group by city B
+            [1.0, 0.0, 1.0, 0.0],  # Group by segment X (shares leaves)
+            [0.0, 1.0, 0.0, 1.0],  # Group by segment Y
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    tags = {
+        "city": np.array([0, 1]),
+        "segment": np.array([2, 3]),
+        "bottom": np.array([4, 5, 6, 7]),
+    }
+    y_hat = np.ones((S.shape[0], 2))
+    with pytest.raises(ValueError, match="strictly hierarchical"):
+        IntegerReconciliation()(S=S, y_hat=y_hat, tags=tags)
+
+
+def test_integer_reconciliation_single_root_grouped_structure(tags_non_hier, S_non_hier):
+    """A grouped hierarchy with one overall root keeps its approved total."""
+    y_hat = np.array(
+        [
+            [10.4],
+            [5.2],
+            [5.2],
+            [5.4],
+            [5.0],
+            [2.7],
+            [2.5],
+            [2.6],
+            [2.6],
+        ]
+    )
+    result = IntegerReconciliation()(
+        S=S_non_hier, y_hat=y_hat, tags=tags_non_hier
+    )["mean"]
+    assert np.issubdtype(result.dtype, np.integer)
+    assert np.all(result >= 0)
+    np.testing.assert_array_equal(result[0], [10])
+    # Grouped aggregates are recomputed from the whole-unit leaves.
+    np.testing.assert_array_equal(result, S_non_hier @ result[-4:])
+
+
+def test_integer_reconciliation_rejects_non_binary_s():
+    """The summing matrix must be a 0/1 aggregation matrix."""
+    S = np.array([[1.0, 2.0], [1.0, 0.0], [0.0, 1.0]])
+    tags = {"root": np.array([0]), "bottom": np.array([1, 2])}
+    with pytest.raises(ValueError, match="0/1 summing matrix"):
+        IntegerReconciliation()(S=S, y_hat=np.ones((3, 1)), tags=tags)
+
+
+def test_integer_reconciliation_rejects_non_identity_bottom():
+    """The bottom block of S must be an identity matrix."""
+    S = np.array([[1.0, 1.0], [2.0, 0.0], [0.0, 1.0]])
+    tags = {"root": np.array([0]), "bottom": np.array([1, 2])}
+    with pytest.raises(ValueError, match="identity matrix"):
+        IntegerReconciliation()(S=S, y_hat=np.ones((3, 1)), tags=tags)
+
+
+def test_integer_reconciliation_leaf_only_input(integer_forest_data):
+    """Leaf-only coordinated forecasts default each root to its rounded sum."""
+    S, tags = integer_forest_data
+    leaves = np.array([[5.1, 3.2], [2.5, 1.2], [1.3, 2.0], [1.1, 3.0]])
+
+    result = IntegerReconciliation()(S=S, y_hat=leaves, tags=tags)["mean"]
+    # Root A: round(5.1+2.5)=8, round(3.2+1.2)=4; root B: round(2.4)=2, round(5.0)=5.
+    np.testing.assert_array_equal(result[0], [8, 4])
+    np.testing.assert_array_equal(result[1], [2, 5])
+    np.testing.assert_array_equal(result, S @ result[-4:])
+
+    approved = IntegerReconciliation()(
+        S=S, y_hat=leaves, tags=tags, approved_totals={0: [8, 4], 1: [2, 5]}
+    )["mean"]
+    np.testing.assert_array_equal(result, approved)
+
+
+def test_integer_reconciliation_leaf_only_matches_full_input(integer_forest_data):
+    """Leaf-only and full-matrix inputs agree when totals are the same."""
+    S, tags = integer_forest_data
+    leaves = np.array([[5.1], [2.5], [1.3], [1.1]])
+    totals = {0: 8, 1: 3}
+    full = np.vstack([[[8.0]], [[3.0]], leaves])
+    leaf_only = IntegerReconciliation()(
+        S=S, y_hat=leaves, approved_totals=totals
+    )["mean"]
+    with_full = IntegerReconciliation()(
+        S=S, y_hat=full, tags=tags, approved_totals=totals
+    )["mean"]
+    np.testing.assert_array_equal(leaf_only, with_full)
+
+
+def test_integer_reconciliation_rejects_wrong_row_count(hierarchical_data):
+    """Only full or leaf-only row counts are accepted."""
+    data = hierarchical_data
+    with pytest.raises(ValueError, match="either 7 rows"):
+        IntegerReconciliation()(S=data.S, y_hat=np.ones((5, 2)), tags=data.tags)
+
+
+def test_publish_whole_units_helper_matches_reconciler(hierarchical_data):
+    """The functional helper matches the reconciler output."""
+    data = hierarchical_data
+    y_hat = np.array(
+        [
+            [10.4],
+            [5.2],
+            [5.2],
+            [2.7],
+            [2.5],
+            [2.6],
+            [2.6],
+        ]
+    )
+    helper = publish_whole_units(S=data.S, y_hat=y_hat, tags=data.tags)
+    reconciler = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)[
+        "mean"
+    ]
+    np.testing.assert_array_equal(helper, reconciler)
+
+
+def test_integer_reconciliation_clips_negative_and_nan_weights(hierarchical_data):
+    """Negative and NaN leaf weights do not receive units."""
+    data = hierarchical_data
+    y_hat = np.array(
+        [
+            [5.0],
+            [1.0],
+            [4.0],
+            [-2.0],
+            [np.nan],
+            [3.0],
+            [0.0],
+        ]
+    )
+    result = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)["mean"]
+    np.testing.assert_array_equal(result[0], [5])
+    leaves = result[-4:, 0]
+    assert leaves.sum() == 5
+    assert leaves[0] == 0  # negative weight clipped
+    assert leaves[1] == 0  # NaN weight treated as zero
+    np.testing.assert_array_equal(result, data.S @ result[-4:])
+
+
+def test_integer_reconciliation_negative_root_forecast_releases_zero(hierarchical_data):
+    """A negative root forecast is clamped to a zero total."""
+    data = hierarchical_data
+    y_hat = np.array([[-3.4], [1.0], [1.0], [1.0], [1.0], [1.0], [1.0]])
+    result = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)["mean"]
+    np.testing.assert_array_equal(result, np.zeros_like(result))
+
+
+def test_integer_reconciliation_rejects_non_finite_root(hierarchical_data):
+    """A NaN root forecast without an approved total is explained."""
+    data = hierarchical_data
+    y_hat = np.array([[np.nan], [1.0], [1.0], [1.0], [1.0], [1.0], [1.0]])
+    with pytest.raises(ValueError, match="non-finite root forecast"):
+        IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)
+
+
+def test_integer_reconciliation_accepts_sparse_summing_matrix(hierarchical_data):
+    """Sparse summing matrices are densified before allocation."""
+    data = hierarchical_data
+    y_hat = np.array([[10.4], [5.2], [5.2], [2.7], [2.5], [2.6], [2.6]])
+    dense = IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags)["mean"]
+    sparse_result = IntegerReconciliation()(
+        S=sparse.csr_matrix(data.S), y_hat=y_hat, tags=data.tags
+    )["mean"]
+    np.testing.assert_array_equal(dense, sparse_result)
+
+
+def test_integer_reconciliation_rejects_bad_input_shapes(hierarchical_data):
+    """Invalid y_hat shapes and approved-total types are explained."""
+    data = hierarchical_data
+    with pytest.raises(ValueError, match="2D array"):
+        IntegerReconciliation()(S=data.S, y_hat=np.ones(7), tags=data.tags)
+    with pytest.raises(TypeError, match="must be a dictionary"):
+        IntegerReconciliation()(
+            S=data.S, y_hat=np.ones((7, 1)), tags=data.tags, approved_totals=[1]
+        )
+    with pytest.raises(ValueError, match="non-negative whole"):
+        IntegerReconciliation()(
+            S=data.S,
+            y_hat=np.ones((7, 1)),
+            tags=data.tags,
+            approved_totals={0: np.inf},
+        )
+
+
+def test_integer_reconciliation_approved_total_overrides_non_finite_root():
+    """An approved total is released even when the root forecast is NaN."""
+    S = np.array([[1.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+    y_hat = np.array([[np.nan], [1.0], [2.0]])
+    result = IntegerReconciliation()(
+        S=S, y_hat=y_hat, approved_totals={0: 3}
+    )["mean"]
+    np.testing.assert_array_equal(result[0], [3])
+    np.testing.assert_array_equal(result, S @ result[-2:])
+
+
+def test_integer_reconciliation_singleton_tree_in_forest():
+    """A bottom series with no aggregate parent is its own root."""
+    S = np.array(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    y_hat = np.array([[4.4], [2.4], [2.2], [3.6]])
+    result = IntegerReconciliation()(S=S, y_hat=y_hat)["mean"]
+    assert np.issubdtype(result.dtype, np.integer)
+    np.testing.assert_array_equal(result, S @ result[-3:])
+    np.testing.assert_array_equal(result[0], [4])
+    np.testing.assert_array_equal(result[3], [4])
+
+
+def test_integer_reconciliation_large_totals_are_exact():
+    """Very large approved totals still sum exactly (no float truncation)."""
+    S = np.array([[1.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
+    big = 10**16 + 7
+    result = IntegerReconciliation()(
+        S=S, y_hat=np.ones((3, 1)), approved_totals={0: big}
+    )["mean"]
+    assert int(result[0, 0]) == big
+    assert int(result[1, 0] + result[2, 0]) == big
+
+
+def test_integer_reconciliation_constructor_approved_totals_survive_fit():
+    """Constructor-approved totals are used when fit is called without them."""
+    S = np.array(
+        [
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    tags = {"root": np.array([0, 1]), "bottom": np.array([2, 3, 4, 5])}
+    y_hat = np.array([[7.6], [2.4], [5.1], [2.5], [1.3], [1.1]])
+    reconciler = IntegerReconciliation(approved_totals={0: 9})
+    reconciler.fit(S=S, y_hat=y_hat, tags=tags)
+    result = reconciler.predict(S=S, y_hat=y_hat)["mean"]
+    np.testing.assert_array_equal(result[0], [9])
+    np.testing.assert_array_equal(result, S @ result[-4:])
+
+
+def test_integer_reconciliation_rejects_intervals(hierarchical_data):
+    """Whole-unit releases are point forecasts only."""
+    data = hierarchical_data
+    y_hat = np.ones((data.S.shape[0], 2))
+    with pytest.raises(NotImplementedError, match="prediction intervals"):
+        IntegerReconciliation()(S=data.S, y_hat=y_hat, tags=data.tags, level=[90])
+
+
+def test_integer_reconciliation_predict_before_fit(hierarchical_data):
+    """Calling predict before fit raises a helpful error."""
+    data = hierarchical_data
+    with pytest.raises(Exception, match="not fitted yet"):
+        IntegerReconciliation().predict(S=data.S, y_hat=np.ones((7, 2)))
 
 
 @pytest.fixture

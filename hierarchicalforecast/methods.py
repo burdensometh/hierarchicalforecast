@@ -1,5 +1,5 @@
 __all__ = ['BottomUp', 'BottomUpSparse', 'TopDown', 'TopDownSparse', 'MiddleOut', 'MiddleOutSparse', 'MinTrace', 'MinTraceSparse',
-           'OptimalCombination', 'ERM']
+           'OptimalCombination', 'ERM', 'IntegerReconciliation', 'publish_whole_units']
 
 
 import warnings
@@ -13,6 +13,7 @@ from scipy import sparse
 
 from hierarchicalforecast.utils import (
     _construct_adjacency_matrix,
+    _is_bottom_identity,
     _is_strictly_hierarchical,
     _lasso,
     _ma_cov,
@@ -2200,3 +2201,587 @@ class ERM(HReconciler):
         )
 
     __call__ = fit_predict
+
+
+def _integer_root_nodes(
+    S: np.ndarray, candidate_rows: np.ndarray | None = None
+) -> np.ndarray:
+    """Return the row indices of the top (root) nodes of an aggregation matrix.
+
+    A root is a node whose leaf support is not a proper subset of any other
+    node's support. In a tree or forest these are exactly the nodes without a
+    parent. A flat hierarchy (only bottom-level nodes) has every row as a root.
+
+    Candidates are visited from the largest to the smallest support. A row is
+    compared against the roots found so far (the maximal sets), not against
+    every row, and a fast ownership test skips rows already contained in a
+    single root. This keeps the common wide-forest case close to linear.
+
+    Args:
+        S: Summing matrix of size (`base`, `bottom`).
+        candidate_rows: Rows that may be roots (the aggregate block, by default
+            all rows). Bottom rows are normally passed out so they are not
+            scanned as potential roots.
+    """
+    binary = S != 0
+    n_rows, n_cols = binary.shape
+    if n_rows == n_cols:
+        # Flat hierarchy: every row is its own root, no subset checks needed.
+        return np.arange(n_rows, dtype=np.int64)
+    if candidate_rows is None:
+        candidate_rows = np.arange(n_rows)
+    candidate_rows = np.asarray(candidate_rows, dtype=np.int64)
+    if candidate_rows.size == 0:
+        return candidate_rows
+    support_sets = {
+        int(row): set(np.flatnonzero(binary[row]).tolist()) for row in candidate_rows
+    }
+    sizes = binary[candidate_rows].sum(axis=1)
+    order = candidate_rows[np.argsort(-sizes, kind="stable")]
+    # `maximal` holds the roots found so far, in descending size order (the same
+    # order as `order`), so a proper superset always comes first.
+    maximal: list[set[int]] = []
+    # `owner[col]` is the index of a root containing `col` (-1 if none) and
+    # `multi[col]` flags a column belonging to more than one root. A row whose
+    # columns all share a single non-shared owner is a subset of that root and
+    # can be skipped without comparing against every root.
+    owner = np.full(n_cols, -1, dtype=np.int64)
+    multi = np.zeros(n_cols, dtype=bool)
+    roots: list[int] = []
+    for row in order:
+        cols = support_sets[int(row)]
+        col_idx = np.fromiter(cols, dtype=np.int64, count=len(cols))
+        row_owner = owner[col_idx]
+        if (
+            len(cols) > 0
+            and np.all(row_owner == row_owner[0])
+            and row_owner[0] >= 0
+            and not multi[col_idx].any()
+        ):
+            # Fast path: the row lies inside a single existing root.
+            continue
+        is_covered = False
+        n_cols_here = len(cols)
+        for other in maximal:
+            if len(other) < n_cols_here:
+                break
+            if cols <= other:
+                is_covered = True
+                break
+        if not is_covered:
+            root_index = len(maximal)
+            for col in cols:
+                if owner[col] == -1:
+                    owner[col] = root_index
+                else:
+                    multi[col] = True
+            maximal.append(cols)
+            roots.append(int(row))
+    return np.sort(np.asarray(roots, dtype=np.int64))
+
+
+def _allocate_whole_units(weights: np.ndarray, total: int) -> np.ndarray:
+    """Split ``total`` whole units across items proportionally to ``weights``.
+
+    Uses the largest-remainder (Hamilton) method: every item first receives the
+    floor of its exact proportional share, and the leftover units are assigned
+    one by one to the items with the largest fractional remainders. Ties are
+    broken by ascending position in ``weights`` (a stable sort), so the result
+    is deterministic for a given input ordering.
+
+    Args:
+        weights: Allocation weights. Negative and non-finite values (NaN/inf)
+            are treated as zero. When all weights are zero the units are split
+            evenly.
+        total: Non-negative whole number of units to allocate.
+
+    Returns:
+        Whole units per item. The values are non-negative, sum to ``total`` and
+        have ``weights.shape[0]`` elements.
+    """
+    weights = np.asarray(weights, dtype=np.float64)
+    n_items = weights.size
+    allocation = np.zeros(n_items, dtype=np.int64)
+    if total <= 0 or n_items == 0:
+        return allocation
+
+    # Non-finite weights (e.g. NaN from a missing forecast) carry no share.
+    positive_weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    np.clip(positive_weights, 0.0, None, out=positive_weights)
+    with np.errstate(over="ignore"):
+        weight_sum = positive_weights.sum()
+    # Rescale huge finite weights whose sum overflows to inf; the split is
+    # unchanged because every weight is multiplied by the same constant.
+    if not np.isfinite(weight_sum) and positive_weights.max() > 0.0:
+        positive_weights = positive_weights / positive_weights.max()
+        weight_sum = positive_weights.sum()
+    if weight_sum > 0.0:
+        probabilities = positive_weights / weight_sum
+    else:
+        # Positive total but no usable leaf weight (e.g. all coordinated leaf
+        # forecasts are zero or negative). Fall back to an even split so the
+        # approved total is still fully released.
+        probabilities = np.full(n_items, 1.0 / n_items, dtype=np.float64)
+
+    exact = probabilities * total
+    allocation = np.floor(exact).astype(np.int64)
+    remainder = int(total - allocation.sum())
+    if remainder > 0:
+        # Stable sort keeps the original leaf order for equal remainders.
+        order = np.argsort(-(exact - allocation), kind="stable")
+        allocation[order[:remainder]] += 1
+    elif remainder < 0:
+        # Float error can over-allocate for very large totals. Remove units from
+        # the items with the smallest fractional remainders (most over-allocated)
+        # so the allocation still sums exactly to `total`.
+        order = np.argsort(exact - allocation, kind="stable")
+        for idx in order[: -remainder]:
+            if allocation[idx] > 0:
+                allocation[idx] -= 1
+    return allocation
+
+
+def _whole_total(value: float) -> int:
+    """Round a non-negative forecast total to a whole number (half up)."""
+    if not np.isfinite(value):
+        raise ValueError(
+            "IntegerReconciliation cannot round a non-finite root forecast. "
+            "Make sure the reconciled forecasts contain only finite values."
+        )
+    return int(np.floor(max(float(value), 0.0) + 0.5))
+
+
+def _approved_whole_total(value) -> int | None:
+    """Validate and convert an approved total to an exact Python integer.
+
+    Returns ``None`` when the value is not a non-negative whole number. Python
+    integers are kept exact (no float64 round-trip), so totals above 2**53 are
+    preserved.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value) if value >= 0 else None
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(as_float) or as_float < 0.0:
+        return None
+    rounded = round(as_float)
+    if abs(as_float - rounded) > 1e-9:
+        return None
+    return int(rounded)
+
+
+class IntegerReconciliation(HReconciler):
+    r"""Whole-unit reconciliation for replenishment releases.
+
+    This method is meant to be applied to coordinated (reconciled) forecasts when
+    the released quantities must be non-negative whole units, for example
+    replenishment orders that can only be placed in complete cases. It preserves
+    the approved whole-unit total of every root and rebuilds the remaining nodes
+    from the rounded leaves, so the published forecasts stay coherent.
+
+    For every root $r$ with leaf set $\mathcal{L}(r)$ and each horizon period
+    $t$, the method:
+
+    1. Takes the root's whole-unit total $T_{r,t}$. By default this is the
+       non-negative root forecast rounded half up (or the rounded sum of the
+       root's leaves when only leaf forecasts are given); it can be overridden
+       with an already approved integer total (``approved_totals``).
+    2. Allocates $T_{r,t}$ across the leaves using their coordinated forecasts
+       as weights and the largest-remainder rule: each leaf receives the floor of
+       its proportional share and the remaining units go to the leaves with the
+       largest fractional remainders, in ascending leaf order to break ties.
+       Negative leaf forecasts are treated as zero weight.
+    3. Recomputes every intermediate (aggregate) node as the sum of its leaves.
+
+    Special cases:
+
+    - A zero root total releases zero units to all of its leaves.
+    - A positive root total with all leaf weights equal to zero is split evenly
+      across the leaves (again breaking ties in ascending leaf order), so the
+      approved total is still fully released.
+
+    The method accepts either the full coordinated forecast matrix of size
+    (`base`, `horizon`) or only the coordinated leaf forecasts of size
+    (`bottom`, `horizon`). With leaf-only input there are no root rows to read,
+    so each root defaults to the rounded sum of its leaves; pass
+    ``approved_totals`` to pin a different approved total.
+
+    Every bottom series must belong to exactly one root. This holds for a tree,
+    for a forest of trees that share no leaves, and for a grouped hierarchy that
+    has a single overall root (its total can be preserved and the grouped
+    aggregates are recomputed as sums of leaves). When several roots share
+    leaves, there is no unique total to preserve per leaf; such structures are
+    rejected with an explanatory error.
+
+    Args:
+        approved_totals: Optional mapping from root node index to an already
+            approved non-negative whole-unit total (a scalar or one value per
+            horizon period). Storing it on the instance lets
+            `HierarchicalReconciliation.reconcile` use it, since that path does
+            not forward per-reconciler arguments. It can still be overridden per
+            call to `fit`/`fit_predict`/`predict`. Default is None.
+
+    Note:
+        The summing matrix ``S`` must be a 0/1 aggregation matrix whose bottom
+        block is an identity matrix, as produced by
+        :func:`hierarchicalforecast.utils.aggregate`.
+
+    References:
+        - [Balinski, M.L., & Young, H.P. (1982). "Fair Representation: Meeting
+        the Ideal of One Man, One Vote". Yale University Press.](
+        https://yalebooks.yale.edu/book/9780815701118/fair-representation/)
+        (largest remainder apportionment).
+    """
+
+    # The allocation preserves a single approved total per root, so leaves must
+    # not be shared between roots. A single-root grouped hierarchy is fine, but
+    # multiple overlapping roots are rejected by `_root_supports` with a
+    # method-specific message, so this is not flagged to the core as requiring a
+    # strictly hierarchical structure.
+    is_strictly_hierarchical = False
+    insample = False
+
+    def __init__(self, approved_totals: dict | None = None):
+        self.approved_totals = approved_totals
+        self._init_params: dict = {}
+
+    @staticmethod
+    def _to_dense(S) -> np.ndarray:
+        if sparse.issparse(S):
+            return S.toarray().astype(np.float64, copy=False)
+        return np.asarray(S, dtype=np.float64)
+
+    def _root_supports(self, S: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+        """Return the root node indices and their leaf-column supports.
+
+        Raises:
+            ValueError: If `S` is not a 0/1 aggregation matrix or if the structure
+                does not let every leaf be assigned to exactly one root (for
+                example a grouped hierarchy).
+        """
+        if not np.all((S == 0.0) | (S == 1.0)):
+            raise ValueError(
+                "IntegerReconciliation expects a 0/1 summing matrix, but `S` "
+                "contains values other than 0 and 1. Build `S` with "
+                "`hierarchicalforecast.utils.aggregate`."
+            )
+        n_bottom = S.shape[1]
+        # Detect roots from the summing matrix itself rather than trusting the
+        # level ordering in `tags`: grouped structures can declare several top
+        # levels, but only a tree/forest gives each leaf a unique root. Scan the
+        # aggregate rows first; bottom rows only become roots when no aggregate
+        # row covers them (a leaf that is its own singleton tree).
+        root_list: list[int] = list(
+            _integer_root_nodes(S, candidate_rows=np.arange(S.shape[0] - n_bottom))
+        )
+        bottom_rows = np.arange(S.shape[0] - n_bottom, S.shape[0])
+
+        supports = [np.flatnonzero(S[root] != 0) for root in root_list]
+        seen = np.zeros(n_bottom, dtype=np.int64)
+        for cols in supports:
+            if cols.size == 0:
+                raise ValueError(
+                    "IntegerReconciliation found a root node without leaves. "
+                    "Each root must aggregate at least one bottom series."
+                )
+            seen[cols] += 1
+
+        # A bottom series covered by no aggregate root is a singleton tree.
+        for leaf in bottom_rows[seen == 0]:
+            root_list.append(int(leaf))
+            supports.append(np.array([int(leaf) - (S.shape[0] - n_bottom)]))
+            seen[int(leaf) - (S.shape[0] - n_bottom)] = 1
+        roots = np.asarray(root_list, dtype=np.int64)
+
+        leaves = np.arange(n_bottom)
+        is_partition = (
+            seen.shape[0] == n_bottom
+            and np.array_equal(np.flatnonzero(seen), leaves)
+            and np.all(seen[leaves] == 1)
+        )
+        if not is_partition:
+            raise ValueError(
+                "IntegerReconciliation requires a strictly hierarchical (tree or "
+                "forest) structure so that every bottom series belongs to exactly "
+                "one root and each root's approved whole-unit total can be "
+                "preserved. The provided structure is grouped (some bottom series "
+                "have multiple parents) or otherwise does not define a unique root "
+                "partition. Reconcile with a method that supports grouped "
+                "hierarchies (e.g. BottomUp or MinTrace) and round the bottom level "
+                "manually, or aggregate the data so that each bottom series has a "
+                "single parent."
+            )
+        return roots, supports
+
+    def _validate_approved_totals(
+        self,
+        approved_totals: dict | None,
+        roots: np.ndarray,
+        horizon: int,
+    ) -> None:
+        if approved_totals is None:
+            return
+        if not isinstance(approved_totals, dict):
+            raise TypeError(
+                "`approved_totals` must be a dictionary mapping root node indices "
+                "to whole-unit totals (a scalar or one value per horizon period)."
+            )
+        root_set = set(int(root) for root in roots)
+        for root, total in approved_totals.items():
+            if int(root) not in root_set:
+                raise ValueError(
+                    f"`approved_totals` contains node {root!r}, which is not a root "
+                    f"of the hierarchy. Valid root indices are {sorted(root_set)}."
+                )
+            values = np.asarray(total, dtype=object)
+            if values.ndim == 0:
+                values = values.reshape(1)
+            if values.ndim != 1 or values.size not in (1, horizon):
+                raise ValueError(
+                    f"`approved_totals[{root!r}]` must be a scalar or a sequence of "
+                    f"length {horizon} (the forecast horizon)."
+                )
+            for value in values:
+                if _approved_whole_total(value) is None:
+                    raise ValueError(
+                        f"`approved_totals[{root!r}]` must contain non-negative whole "
+                        f"numbers, got {values.tolist()}."
+                    )
+
+    def _approved_total(
+        self,
+        approved_totals: dict | None,
+        root: int,
+        position: int,
+    ) -> int | None:
+        """Return the approved whole-unit total for a root, if one was given."""
+        if approved_totals is None or root not in approved_totals:
+            return None
+        values = np.asarray(approved_totals[root], dtype=object).reshape(-1)
+        value = values[0] if values.size == 1 else values[position]
+        return _approved_whole_total(value)
+
+    def _round_forecasts(
+        self,
+        S,
+        y_hat: np.ndarray,
+        approved_totals: dict | None = None,
+    ) -> np.ndarray:
+        S_dense = self._to_dense(S)
+        y_hat = np.asarray(y_hat, dtype=np.float64)
+        if y_hat.ndim != 2:
+            raise ValueError(
+                f"`y_hat` must be a 2D array of shape (n_series, horizon), got shape {y_hat.shape}."
+            )
+        n_hiers, n_bottom = S_dense.shape
+        horizon = y_hat.shape[1]
+
+        # Follow the library convention: the bottom n_bottom rows are the
+        # identity block, so their own forecasts are the leaf weights.
+        bottom_block = S_dense[n_hiers - n_bottom :]
+        if not _is_bottom_identity(bottom_block, n_bottom):
+            raise ValueError(
+                "IntegerReconciliation expects the bottom "
+                f"{n_bottom}x{n_bottom} block of `S` to be an identity matrix. "
+                "Build `S` with `hierarchicalforecast.utils.aggregate`."
+            )
+
+        roots, supports = self._root_supports(S_dense)
+        self._validate_approved_totals(approved_totals, roots, horizon)
+
+        bottom_rows = np.arange(n_hiers - n_bottom, n_hiers)
+        if y_hat.shape[0] == n_hiers:
+            # Full coordinated forecast matrix: the root rows carry the totals.
+            root_values = y_hat[roots]
+            leaf_weights = y_hat[bottom_rows]
+        elif y_hat.shape[0] == n_bottom:
+            # Coordinated leaf forecasts only. Roots have no forecast row, so
+            # their default total is the rounded sum of the root's leaves.
+            root_values = None
+            leaf_weights = y_hat
+        else:
+            raise ValueError(
+                f"`y_hat` must have either {n_hiers} rows (all series) or "
+                f"{n_bottom} rows (bottom series only), got {y_hat.shape[0]}."
+            )
+
+        bottom_ints = np.zeros((n_bottom, horizon), dtype=np.int64)
+        for root_position, (root, cols) in enumerate(zip(roots, supports, strict=True)):
+            for position in range(horizon):
+                total = self._approved_total(approved_totals, int(root), position)
+                if total is None:
+                    # Only fall back to the forecast when no approved total was
+                    # supplied, so a non-finite forecast cannot block an approved
+                    # total from being released.
+                    if root_values is not None:
+                        total = _whole_total(root_values[root_position, position])
+                    else:
+                        total = _whole_total(np.nansum(leaf_weights[cols, position]))
+                bottom_ints[cols, position] = _allocate_whole_units(
+                    leaf_weights[cols, position], total
+                )
+
+        # Rebuild every aggregate node from the whole-unit leaves. `S` is 0/1, so
+        # each aggregate is simply the sum of its leaves; summing int64 keeps very
+        # large approved totals exact (a float matmul would lose precision).
+        y_tilde = np.zeros((n_hiers, horizon), dtype=np.int64)
+        for row in range(n_hiers):
+            cols = np.flatnonzero(S_dense[row] != 0)
+            if cols.size:
+                y_tilde[row] = bottom_ints[cols].sum(axis=0, dtype=np.int64)
+        return y_tilde
+
+    def fit(
+        self,
+        S,
+        y_hat: np.ndarray,
+        tags: dict[str, np.ndarray] | None = None,
+        approved_totals: dict | None = None,
+        **kwargs,
+    ):
+        """Fit the whole-unit reconciler.
+
+        Args:
+            S: Summing matrix of size (`base`, `bottom`).
+            y_hat: Coordinated forecasts of size (`base`, `horizon`), or leaf-only
+                forecasts of size (`bottom`, `horizon`).
+            tags: Each key is a level and each value its `S` indices. It is not
+                used for the allocation (roots are read from `S`), but is accepted
+                so the reconciler plugs into `HierarchicalReconciliation`. Default
+                is None.
+            approved_totals: Optional mapping from root node index to an already
+                approved non-negative whole-unit total (scalar or one value per
+                horizon period). Roots that are omitted are rounded half up from
+                their coordinated forecast, or from the sum of their leaves when
+                `y_hat` contains only the bottom level. Default is None.
+
+        Returns:
+            self: object, fitted reconciler.
+        """
+        self.S = S
+        self.tags = tags
+        if approved_totals is not None:
+            self.approved_totals = approved_totals
+        self.fitted = True
+        return self
+
+    def predict(
+        self,
+        S,
+        y_hat: np.ndarray,
+        level: list[int] | None = None,
+        approved_totals: dict | None = None,
+    ):
+        """Publish whole-unit forecasts from coordinated forecasts.
+
+        Args:
+            S: Summing matrix of size (`base`, `bottom`).
+            y_hat: Coordinated forecasts of size (`base`, `horizon`), or leaf-only
+                forecasts of size (`bottom`, `horizon`).
+            level: Unsupported; whole-unit forecasts do not provide prediction
+                intervals. Must be None.
+            approved_totals: Optional approved whole-unit totals per root.
+                Defaults to the values passed to :meth:`fit`.
+
+        Returns:
+            dict: ``{"mean": y_tilde}`` where ``y_tilde`` is an ``int64`` array
+            of size (`base`, `horizon`) with coherent non-negative whole units.
+        """
+        if not self.fitted:
+            raise Exception("This model instance is not fitted yet, Call fit method.")
+        if level is not None:
+            raise NotImplementedError(
+                "IntegerReconciliation publishes point forecasts only; it does not "
+                "support prediction intervals. Use level=None."
+            )
+        if approved_totals is None:
+            approved_totals = self.approved_totals
+        return {"mean": self._round_forecasts(S, y_hat, approved_totals)}
+
+    def fit_predict(
+        self,
+        S,
+        y_hat: np.ndarray,
+        tags: dict[str, np.ndarray] | None = None,
+        approved_totals: dict | None = None,
+        level: list[int] | None = None,
+        **kwargs,
+    ):
+        """Integer (whole-unit) reconciliation of coordinated forecasts.
+
+        Args:
+            S: Summing matrix of size (`base`, `bottom`).
+            y_hat: Coordinated forecasts of size (`base`, `horizon`), or leaf-only
+                forecasts of size (`bottom`, `horizon`).
+            tags: Each key is a level and each value its `S` indices. It is not
+                used for the allocation (roots are read from `S`), but is accepted
+                so the reconciler plugs into `HierarchicalReconciliation`. Default
+                is None.
+            approved_totals: Optional mapping from root node index to an already
+                approved non-negative whole-unit total (scalar or one value per
+                horizon period). Roots that are omitted are rounded half up from
+                their coordinated forecast, or from the sum of their leaves when
+                `y_hat` contains only the bottom level. Default is None.
+            level: Unsupported; whole-unit forecasts do not provide prediction
+                intervals. Must be None.
+
+        Returns:
+            dict: ``{"mean": y_tilde}`` where ``y_tilde`` is an ``int64`` array
+            of size (`base`, `horizon`) with coherent non-negative whole units.
+        """
+        self.fit(
+            S=S,
+            y_hat=y_hat,
+            tags=tags,
+            approved_totals=approved_totals,
+        )
+        return self.predict(
+            S=S,
+            y_hat=y_hat,
+            approved_totals=approved_totals,
+            level=level,
+        )
+
+    __call__ = fit_predict
+
+
+def publish_whole_units(
+    S,
+    y_hat: np.ndarray,
+    tags: dict[str, np.ndarray] | None = None,
+    approved_totals: dict | None = None,
+) -> np.ndarray:
+    """Convert coordinated forecasts into coherent non-negative whole units.
+
+    This is a functional shortcut for :class:`IntegerReconciliation`. It rounds
+    each root's approved total, allocates it across the root's leaves with the
+    largest-remainder rule (ties broken in ascending leaf order), and recomputes
+    intermediate nodes so the published matrix stays coherent.
+
+    Args:
+        S: Summing matrix of size (`base`, `bottom`).
+        y_hat: Coordinated forecasts of size (`base`, `horizon`), or leaf-only
+            forecasts of size (`bottom`, `horizon`).
+        tags: Each key is a level and each value its `S` indices. Accepted for
+            API symmetry; roots are read from `S`. Default is None.
+        approved_totals: Optional mapping from root node index to an approved
+            non-negative whole-unit total (scalar or one value per horizon
+            period). Default is None.
+
+    Returns:
+        np.ndarray: `int64` array of size (`base`, `horizon`) with coherent
+        non-negative whole units.
+
+    Raises:
+        ValueError: If the structure does not define a unique root per leaf (for
+            example a grouped hierarchy with overlapping roots), if `S` is not a
+            0/1 aggregation matrix, or if the bottom block of `S` is not an
+            identity matrix.
+    """
+    return IntegerReconciliation()(
+        S=S, y_hat=y_hat, tags=tags, approved_totals=approved_totals
+    )["mean"]
