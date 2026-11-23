@@ -1,3 +1,4 @@
+import narwhals.stable.v2 as nw
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -16,6 +17,7 @@ from hierarchicalforecast.utils import (
     level_to_outputs,
     make_future_dataframe,
     quantiles_to_outputs,
+    revise,
     samples_to_quantiles_df,
 )
 
@@ -653,3 +655,265 @@ def test_cov_equivalence():
 
     # Check equivalence of diagonal elements of shrunk W to non-shrunk W in case of no nans
     np.testing.assert_allclose(np.diag(W_np), np.diag(W_ss_nan), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# revise: late leaf corrections to an aggregated hierarchy
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def revise_data():
+    """A small strictly hierarchical panel spanning two dates."""
+    df = pd.DataFrame(
+        {
+            "country": ["COUNTRY"] * 8,
+            "state": ["NSW", "NSW", "VIC", "VIC"] * 2,
+            "repo": ["A", "B"] * 4,
+            "ds": pd.to_datetime(["2020-01-01"] * 4 + ["2020-02-01"] * 4),
+            "y": [10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    spec = [["country"], ["country", "state"], ["country", "state", "repo"]]
+    Y_df, S_df, tags = aggregate(df, spec)
+    return {"Y_df": Y_df, "S_df": S_df, "tags": tags, "spec": spec, "raw": df}
+
+
+def _value_at(frame, uid, ds):
+    native = nw.from_native(frame)
+    mask = (nw.col("unique_id") == uid) & (nw.col("ds") == ds)
+    return float(native.filter(mask)["y"].to_list()[0])
+
+
+@pytest.mark.parametrize("lib", ["pandas", "polars"])
+def test_revise_updates_leaf_and_parents(revise_data, lib):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    ds = pd.Timestamp("2020-01-01")
+    corrections = pd.DataFrame(
+        {
+            "country": ["COUNTRY"],
+            "state": ["NSW"],
+            "repo": ["A"],
+            "ds": [ds],
+            "y": [15.0],
+        }
+    )
+    if lib == "polars":
+        Y_in, corr_in = pl.from_pandas(Y_df), pl.from_pandas(corrections)
+    else:
+        Y_in, corr_in = Y_df, corrections
+
+    revised = revise(Y_in, corr_in, spec)
+
+    assert _value_at(revised, "COUNTRY/NSW/A", ds) == 15.0
+    # Parents move by exactly the leaf delta (15 - 10 = 5).
+    assert _value_at(revised, "COUNTRY/NSW", ds) == 35.0
+    assert _value_at(revised, "COUNTRY", ds) == 105.0
+    # Avenue untouched by the correction keeps its value.
+    assert _value_at(revised, "COUNTRY/VIC", ds) == 70.0
+    assert _value_at(revised, "COUNTRY/NSW/A", pd.Timestamp("2020-02-01")) == 1.0
+
+
+def test_revise_id_only_corrections(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    ds = pd.Timestamp("2020-01-01")
+    corrections = pd.DataFrame({"unique_id": ["COUNTRY/NSW/B"], "ds": [ds], "y": [25.0]})
+    revised = revise(Y_df, corrections, spec)
+    assert _value_at(revised, "COUNTRY/NSW/B", ds) == 25.0
+    # NSW was 10 + 20; the leaf delta of +5 is reflected in the parent.
+    assert _value_at(revised, "COUNTRY/NSW", ds) == 35.0
+    assert _value_at(revised, "COUNTRY", ds) == 105.0
+
+
+def test_revise_parent_receives_sum_of_deltas(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    ds = pd.Timestamp("2020-01-01")
+    corrections = pd.DataFrame(
+        {
+            "unique_id": ["COUNTRY/NSW/A", "COUNTRY/NSW/B"],
+            "ds": [ds, ds],
+            "y": [12.0, 24.0],
+        }
+    )
+    revised = revise(Y_df, corrections, spec)
+    # NSW was 30, leaves move by +2 and +4.
+    assert _value_at(revised, "COUNTRY/NSW", ds) == 36.0
+    assert _value_at(revised, "COUNTRY", ds) == 106.0
+
+
+def test_revise_is_idempotent(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    ds = pd.Timestamp("2020-01-01")
+    corrections = pd.DataFrame({"unique_id": ["COUNTRY/NSW/A"], "ds": [ds], "y": [15.0]})
+    once = revise(Y_df, corrections, spec)
+    twice = revise(once, corrections, spec)
+    assert once.equals(twice)
+
+    # Re-sending the same delivery twice in one batch is also a no-op.
+    duplicated = pd.concat([corrections, corrections], ignore_index=True)
+    assert revise(Y_df, duplicated, spec).equals(once)
+
+
+def test_revise_version_column_is_order_independent(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    ds = pd.Timestamp("2020-01-01")
+    # Same leaf/date, two deliveries; version 2 is the latest.
+    corrections = pd.DataFrame(
+        {
+            "unique_id": ["COUNTRY/NSW/A", "COUNTRY/NSW/A"],
+            "ds": [ds, ds],
+            "y": [16.0, 15.0],
+            "version": [2, 1],
+        }
+    )
+    revised = revise(Y_df, corrections, spec, version_col="version")
+    assert _value_at(revised, "COUNTRY/NSW/A", ds) == 16.0
+
+    # Reversed row order gives the same result.
+    reversed_corr = corrections.iloc[::-1].reset_index(drop=True)
+    revised_rev = revise(Y_df, reversed_corr, spec, version_col="version")
+    assert revised.equals(revised_rev)
+
+
+def test_revise_stale_delivery_matches_value(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    ds = pd.Timestamp("2020-01-01")
+    newer = pd.DataFrame({"unique_id": ["COUNTRY/NSW/A"], "ds": [ds], "y": [15.0]})
+    applied = revise(Y_df, newer, spec)
+    # Re-delivering the value that is already stored changes nothing.
+    repeated = revise(applied, newer, spec)
+    assert applied.equals(repeated)
+
+
+def test_revise_conflicting_duplicates_require_version(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    ds = pd.Timestamp("2020-01-01")
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW/A", "COUNTRY/NSW/A"], "ds": [ds, ds], "y": [15.0, 16.0]}
+    )
+    with pytest.raises(ValueError, match="version_col"):
+        revise(Y_df, corrections, spec)
+
+
+def test_revise_unknown_leaf_raises(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW/MISSING"], "ds": [pd.Timestamp("2020-01-01")], "y": [1.0]}
+    )
+    with pytest.raises(ValueError, match="not part of the hierarchy's leaf level"):
+        revise(Y_df, corrections, spec)
+
+
+def test_revise_non_leaf_identifier_raises(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    # A parent identifier cannot be treated as a leaf correction.
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW"], "ds": [pd.Timestamp("2020-01-01")], "y": [1.0]}
+    )
+    with pytest.raises(ValueError, match="not part of the hierarchy's leaf level"):
+        revise(Y_df, corrections, spec)
+
+
+def test_revise_unknown_timestamp_raises(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW/A"], "ds": [pd.Timestamp("2030-01-01")], "y": [1.0]}
+    )
+    with pytest.raises(ValueError, match="timestamps not present in `Y_df`"):
+        revise(Y_df, corrections, spec)
+
+
+def test_revise_missing_columns_raise(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    with pytest.raises(ValueError, match="`corrections` is missing columns"):
+        revise(Y_df, pd.DataFrame({"unique_id": ["COUNTRY/NSW/A"], "y": [1.0]}), spec)
+
+    with pytest.raises(ValueError, match="must be numeric"):
+        revise(
+            Y_df,
+            pd.DataFrame(
+                {"unique_id": ["COUNTRY/NSW/A"], "ds": [pd.Timestamp("2020-01-01")], "y": ["x"]}
+            ),
+            spec,
+        )
+
+
+def test_revise_spec_must_be_subset_of_leaf(revise_data):
+    Y_df = revise_data["Y_df"]
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW/A"], "ds": [pd.Timestamp("2020-01-01")], "y": [1.0]}
+    )
+    bad_spec = [["country", "state"], ["country", "state", "repo"], ["repo", "ds"]]
+    with pytest.raises(ValueError, match="not a subset of the leaf level"):
+        revise(Y_df, corrections, bad_spec)
+
+
+def test_revise_grouped_hierarchy(revise_data):
+    df = revise_data["raw"]
+    grouped_spec = [
+        ["country"],
+        ["country", "state"],
+        ["country", "repo"],
+        ["country", "state", "repo"],
+    ]
+    Y_df, _, _ = aggregate(df, grouped_spec)
+    ds = pd.Timestamp("2020-01-01")
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW/A"], "ds": [ds], "y": [25.0]}
+    )
+    revised = revise(Y_df, corrections, grouped_spec)
+    # The corrected leaf contributes to both parents that contain it.
+    assert _value_at(revised, "COUNTRY/NSW", ds) == 45.0
+    assert _value_at(revised, "COUNTRY/A", ds) == 55.0
+    assert _value_at(revised, "COUNTRY", ds) == 115.0
+
+
+def test_revise_does_not_mutate_inputs(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    before = Y_df.copy()
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW/A"], "ds": [pd.Timestamp("2020-01-01")], "y": [15.0]}
+    )
+    revise(Y_df, corrections, spec)
+    pd.testing.assert_frame_equal(Y_df, before)
+
+
+def test_revise_empty_corrections_is_noop(revise_data):
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    empty = Y_df.iloc[0:0].copy()
+    assert revise(Y_df, empty, spec).equals(Y_df)
+
+
+def test_revise_fractional_correction_promotes_integer_column(revise_data):
+    df = revise_data["raw"].copy()
+    df["y"] = df["y"].astype(int)
+    spec = revise_data["spec"]
+    Y_df, _, _ = aggregate(df, spec)
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW/A"], "ds": [pd.Timestamp("2020-01-01")], "y": [15.5]}
+    )
+    revised = revise(Y_df, corrections, spec)
+    assert revised["y"].dtype == np.dtype("float64")
+    assert _value_at(revised, "COUNTRY/NSW", pd.Timestamp("2020-01-01")) == 35.5
+
+
+def test_revise_dtype_preserved_when_whole(revise_data):
+    df = revise_data["raw"].copy()
+    df["y"] = df["y"].astype(int)
+    spec = revise_data["spec"]
+    Y_df, _, _ = aggregate(df, spec)
+    corrections = pd.DataFrame(
+        {"unique_id": ["COUNTRY/NSW/A"], "ds": [pd.Timestamp("2020-01-01")], "y": [15]}
+    )
+    revised = revise(Y_df, corrections, spec)
+    assert revised["y"].dtype == np.dtype("int64")
+
+
+def test_revise_accepts_any_spec_order(revise_data):
+    """Level order does not matter; `aggregate` sorts by depth."""
+    Y_df, spec = revise_data["Y_df"], revise_data["spec"]
+    ds = pd.Timestamp("2020-01-01")
+    corrections = pd.DataFrame({"unique_id": ["COUNTRY/NSW/A"], "ds": [ds], "y": [15.0]})
+    canonical = revise(Y_df, corrections, spec)
+    shuffled = revise(Y_df, corrections, list(reversed(spec)))
+    assert canonical.equals(shuffled)

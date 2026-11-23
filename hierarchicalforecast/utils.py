@@ -1,4 +1,4 @@
-__all__ = ['aggregate', 'aggregate_temporal', 'make_future_dataframe', 'get_cross_temporal_tags', 'HierarchicalPlot', 'set_num_threads', 'get_num_threads', 'SMatrix']
+__all__ = ['aggregate', 'aggregate_temporal', 'revise', 'make_future_dataframe', 'get_cross_temporal_tags', 'HierarchicalPlot', 'set_num_threads', 'get_num_threads', 'SMatrix']
 
 
 import itertools
@@ -382,6 +382,407 @@ def aggregate(
         S_df._bottom_identity_verified = True
 
     return Y_df, S_df, tags
+
+
+def revise(
+    Y_df: Frame,
+    corrections: Frame,
+    spec: list[list[str]],
+    version_col: str | None = None,
+    id_col: str = "unique_id",
+    time_col: str = "ds",
+    target_cols: Sequence[str] = ("y",),
+) -> FrameT:
+    """Apply late leaf corrections to an aggregated hierarchy.
+
+    Aggregations produced by :func:`aggregate` are frequently refreshed by a
+    source system that re-sends a bottom (leaf) series for a date it has
+    already delivered. ``revise`` is the entry point for those corrections: it
+    takes an aggregated ``Y_df``, a ``corrections`` frame with revised leaf
+    values, and the same ``spec`` used to build the hierarchy, and returns a
+    new ``Y_df`` in which the corrected leaves and every parent that contains
+    them are updated.
+
+    The update is derived from the difference between the stored and the new
+    leaf value (``delta = new - old``). Only that difference is propagated, so
+    a parent with several corrected leaves receives the sum of their deltas
+    while the rest of its value is preserved.
+
+    ``corrections`` is interpreted as a set of latest versions rather than as
+    an event log. Applying the same delivery twice is a no-op, so re-running a
+    pipeline over an overlapping window produces the same result. When two
+    rows describe the same leaf and date, use ``version_col`` to say which one
+    is newer; lower values are treated as older. A delivery whose value
+    matches what is already stored is also a no-op.
+
+    Args:
+        Y_df (Frame): Aggregated hierarchical series, as returned by
+            :func:`aggregate`. Must contain ``id_col``, ``time_col`` and
+            ``target_cols``; any other columns are copied through unchanged.
+        corrections (Frame): Revised bottom (leaf) observations. Each row
+            identifies a leaf either through ``id_col`` (using the same
+            ``"/"``-joined identifier that :func:`aggregate` produces) or
+            through one column per level name of the leaf level (the deepest
+            element of ``spec``). Must contain ``time_col`` and revised values
+            in ``target_cols``, and may contain ``version_col``.
+        spec (list[list[str]]): The exact level specification used to build
+            ``Y_df`` with :func:`aggregate`. Its deepest element is the leaf
+            level and its other elements define the parents; the order of the
+            elements does not matter.
+        version_col (Optional[str], optional): Column in ``corrections`` that
+            orders versions of a correction for the same leaf and date. Lower
+            values are older. Default is None.
+        id_col (str, optional): Column that identifies each series.
+            Default is "unique_id".
+        time_col (str, optional): Column that identifies each timestep.
+            Default is "ds".
+        target_cols (Sequence[str], optional): Columns holding the values to
+            revise. Default is ("y",).
+
+    Returns:
+        FrameT: A copy of ``Y_df`` with corrected leaves and parents. Pass it
+        as ``Y_df`` to :meth:`~hierarchicalforecast.core.HierarchicalReconciliation.reconcile`
+        so methods that use historical values read the corrected data.
+
+    Raises:
+        ValueError: If a correction cannot be placed in the hierarchy, for
+            example because of missing columns, a leaf identifier outside the
+            leaf level, a parent identifier absent from ``Y_df``, a timestamp
+            absent from ``Y_df``, or conflicting duplicate corrections.
+
+    Notes:
+        ``spec`` levels must be subsets of the leaf level (the layout
+        :func:`aggregate` accepts). For grouped hierarchies, parent
+        identifiers are rebuilt from the leaf columns named by each level, so
+        they need not be prefixes of the leaf identifier.
+    """
+    target_cols = list(target_cols)
+    # `aggregate` orders levels by depth, so the leaf level is always the
+    # deepest one regardless of the caller's ordering. Normalise first so the
+    # subset validation below sees the actual leaf level.
+    spec = sorted(spec, key=len) if spec else spec
+    _validate_revise_inputs(spec, target_cols, version_col)
+
+    leaf_level = list(spec[-1])
+    Y_nw = nw.from_native(Y_df)
+    corrections_nw = nw.from_native(corrections)
+    backend = Y_nw.implementation
+
+    _validate_revise_columns(
+        Y_nw, corrections_nw, leaf_level, id_col, time_col, target_cols, version_col
+    )
+
+    # Align the time dtype so joins are well typed. Strings are parsed as
+    # timestamps, mirroring `aggregate`'s handling of `ds`.
+    corrections_nw = _coerce_time_dtype(corrections_nw, Y_nw.schema[time_col], time_col)
+
+    # Give every correction row an explicit leaf identifier.
+    corrections_nw = _with_leaf_identifier(corrections_nw, leaf_level, id_col)
+
+    # Recover the identifiers of every level from `Y_df`, then map each
+    # corrected leaf onto the parent identifiers that contain it.
+    known_ids = set(Y_nw[id_col].to_list())
+    leaf_level_ids = _ids_at_depth(known_ids, len(leaf_level))
+    if not leaf_level_ids:
+        raise ValueError(
+            "`Y_df` has no series at the leaf level "
+            f"{reprlib.repr(leaf_level)}, so there is nothing to correct."
+        )
+
+    corrected_leaves = sorted(set(corrections_nw["__hf_leaf__"].to_list()))
+    unknown_leaves = [leaf for leaf in corrected_leaves if leaf not in leaf_level_ids]
+    if unknown_leaves:
+        raise ValueError(
+            "`corrections` contains leaf identifiers that are not part of the "
+            f"hierarchy's leaf level: {reprlib.repr(unknown_leaves)}. "
+            "Leaf identifiers must match the '/' joined values of "
+            f"{reprlib.repr(leaf_level)} produced by `aggregate`."
+        )
+
+    # Map leaf -> identifiers of every level (parents and the leaf itself).
+    leaf_to_ids = _map_leaf_to_level_ids(corrected_leaves, spec, leaf_level, known_ids)
+
+    # Every timestamp must be covered by `Y_df`, otherwise a correction would
+    # silently fail to reach any row.
+    known_times = set(Y_nw[time_col].to_list())
+    unknown_times = sorted(
+        {time for time in corrections_nw[time_col].to_list() if time not in known_times}
+    )
+    if unknown_times:
+        raise ValueError(
+            "`corrections` contains timestamps not present in `Y_df`: "
+            f"{reprlib.repr(unknown_times)}"
+        )
+
+    # Collapse deliveries to the latest version per (leaf, date).
+    corrections_nw = _select_latest_versions(
+        corrections_nw, target_cols, version_col, time_col
+    )
+
+    # Compute each corrected leaf's delta against the stored value.
+    stored_leaves = Y_nw.select(
+        nw.col(id_col).alias("__hf_leaf__"),
+        nw.col(time_col),
+        *[nw.col(col).alias(f"__hf_old_{col}__") for col in target_cols],
+    )
+    joined = corrections_nw.join(
+        stored_leaves, on=["__hf_leaf__", time_col], how="left"
+    )
+    joined = joined.with_columns(
+        *[
+            (
+                nw.col(col).cast(nw.Float64)
+                - nw.col(f"__hf_old_{col}__").cast(nw.Float64)
+            ).alias(f"__hf_delta_{col}__")
+            for col in target_cols
+        ]
+    )
+
+    # Distribute each delta to every level containing the leaf. Using the
+    # per-level identifier mapping also supports grouped hierarchies, where a
+    # parent is a subset of the leaf columns rather than a prefix.
+    delta_cols = [f"__hf_delta_{col}__" for col in target_cols]
+    leaves = joined["__hf_leaf__"].to_list()
+    frames = []
+    for level_index in range(len(spec)):
+        tids = [leaf_to_ids[leaf][level_index] for leaf in leaves]
+        frames.append(
+            joined.with_columns(
+                nw.new_series(
+                    "__hf_tid__",
+                    np.array(tids, dtype=object),
+                    backend=backend,
+                    dtype=nw.String,
+                )
+            ).select("__hf_tid__", time_col, *delta_cols)
+        )
+    contributions = nw.concat(frames, how="vertical")
+
+    # The mapped identifier must exist for the corrected timestamp; otherwise
+    # a delta would be dropped when merging back into `Y_df`.
+    existing_pairs = set(
+        zip(Y_nw[id_col].to_list(), Y_nw[time_col].to_list(), strict=False)
+    )
+    unplaceable = [
+        (tid, time)
+        for tid, time in set(
+            zip(
+                contributions["__hf_tid__"].to_list(),
+                contributions[time_col].to_list(),
+                strict=False,
+            )
+        )
+        if (tid, time) not in existing_pairs
+    ]
+    if unplaceable:
+        raise ValueError(
+            "`corrections` cannot be placed in the existing hierarchy: the "
+            "resolved series/timestamps are not present in `Y_df`: "
+            f"{reprlib.repr(sorted(unplaceable)[:5])}"
+        )
+
+    aggregated = contributions.group_by(["__hf_tid__", time_col]).agg(
+        *[nw.col(col).sum() for col in delta_cols]
+    )
+
+    # Merge the summed deltas back onto `Y_df`, preserving row order. Values
+    # are combined in floating point; integer columns are only cast back when
+    # every corrected value stayed whole, so fractional corrections are not
+    # silently truncated.
+    Y_indexed = Y_nw.with_row_index("__hf_row__")
+    merged = Y_indexed.join(
+        aggregated.rename({"__hf_tid__": id_col}),
+        on=[id_col, time_col],
+        how="left",
+    )
+    computed_cols = [f"__hf_new_{col}__" for col in target_cols]
+    merged = merged.with_columns(
+        *[
+            (
+                nw.col(col).cast(nw.Float64)
+                + nw.col(f"__hf_delta_{col}__").fill_null(0.0)
+            ).alias(f"__hf_new_{col}__")
+            for col in target_cols
+        ]
+    )
+    # Decide the output dtype per target column: keep the original dtype when
+    # possible, promoting an integer column to float only if a fractional
+    # correction would otherwise be truncated.
+    restore_exprs = []
+    for col, new_col in zip(target_cols, computed_cols, strict=False):
+        original_dtype = Y_nw.schema[col]
+        values = merged[new_col].to_numpy()
+        can_keep = original_dtype.is_integer() and bool(
+            np.all(np.isfinite(values)) and np.all(values == np.floor(values))
+        )
+        target_dtype = original_dtype if can_keep else nw.Float64
+        restore_exprs.append(nw.col(new_col).cast(target_dtype).alias(col))
+    merged = merged.with_columns(*restore_exprs)
+    result = merged.sort("__hf_row__").drop("__hf_row__", *delta_cols, *computed_cols)
+    return result.to_native()
+
+
+def _validate_revise_inputs(spec, target_cols, version_col) -> None:
+    """Validate the static arguments of :func:`revise`."""
+    if not spec:
+        raise ValueError("`spec` must contain at least one level.")
+    if not target_cols:
+        raise ValueError("`target_cols` must contain at least one column.")
+    for level in spec:
+        if not level:
+            raise ValueError("Every level of `spec` must not be empty.")
+    leaf_level = spec[-1]
+    for level in spec:
+        missing = set(level) - set(leaf_level)
+        if missing:
+            raise ValueError(
+                f"`spec` level {level} is not a subset of the leaf level "
+                f"{leaf_level} (extra columns: {reprlib.repr(sorted(missing))}), "
+                "so leaf corrections cannot update it."
+            )
+    if version_col is not None and not isinstance(version_col, str):
+        raise ValueError("`version_col` must be a column name.")
+
+
+def _validate_revise_columns(
+    Y_nw, corrections_nw, leaf_level, id_col, time_col, target_cols, version_col
+) -> None:
+    """Check that the frames carry the columns :func:`revise` needs."""
+    missing_y = [
+        col for col in [id_col, time_col, *target_cols] if col not in Y_nw.columns
+    ]
+    if missing_y:
+        raise ValueError(f"`Y_df` is missing columns: {reprlib.repr(missing_y)}")
+
+    missing_corr = [
+        col for col in [time_col, *target_cols] if col not in corrections_nw.columns
+    ]
+    if missing_corr:
+        raise ValueError(
+            f"`corrections` is missing columns: {reprlib.repr(missing_corr)}"
+        )
+
+    level_cols = [col for col in leaf_level if col in corrections_nw.columns]
+    has_id = id_col in corrections_nw.columns
+    if not level_cols and not has_id:
+        raise ValueError(
+            "`corrections` must contain either the leaf id column "
+            f"`{id_col}` or the leaf level columns {reprlib.repr(list(leaf_level))}."
+        )
+    if level_cols and len(level_cols) != len(leaf_level):
+        raise ValueError(
+            "`corrections` provides only part of the leaf level columns "
+            f"{reprlib.repr(list(leaf_level))}; provide all of them or use `{id_col}`."
+        )
+    if version_col is not None and version_col not in corrections_nw.columns:
+        raise ValueError(
+            f"`version_col` {reprlib.repr(version_col)} is not present in "
+            "`corrections`."
+        )
+    for col in target_cols:
+        if not corrections_nw.schema[col].is_numeric():
+            raise ValueError(f"Column `{col}` in `corrections` must be numeric.")
+        if corrections_nw[col].is_null().any():
+            raise ValueError(f"Column `{col}` in `corrections` contains null values.")
+
+
+def _coerce_time_dtype(frame, target_dtype, col: str):
+    """Cast ``col`` to ``target_dtype``, parsing strings as timestamps."""
+    if frame.schema[col] == target_dtype:
+        return frame
+    if frame.schema[col] == nw.String and target_dtype.is_temporal():
+        try:
+            return frame.with_columns(
+                nw.col(col).str.to_datetime().cast(target_dtype).alias(col)
+            )
+        except Exception as exc:  # pragma: no cover - backend specific message
+            raise ValueError(
+                f"Failed to parse `{col}` in `corrections` as timestamps."
+            ) from exc
+    try:
+        return frame.with_columns(nw.col(col).cast(target_dtype).alias(col))
+    except Exception as exc:
+        raise ValueError(
+            f"`{col}` in `corrections` has dtype {frame.schema[col]} which is "
+            f"incompatible with `Y_df` ({target_dtype})."
+        ) from exc
+
+
+def _with_leaf_identifier(frame, leaf_level, id_col):
+    """Add a `__hf_leaf__` column holding each correction's leaf identifier."""
+    level_cols = [col for col in leaf_level if col in frame.columns]
+    if level_cols:
+        frame = frame.with_columns(
+            nw.concat_str(
+                [nw.col(col).cast(nw.String) for col in leaf_level], separator="/"
+            ).alias("__hf_leaf__")
+        )
+        if id_col in frame.columns:
+            mismatch = frame.filter(nw.col(id_col) != nw.col("__hf_leaf__"))
+            if len(mismatch) > 0:
+                raise ValueError(
+                    "`corrections` rows disagree between the leaf level columns "
+                    f"and `{id_col}`: "
+                    f"{reprlib.repr(mismatch.head(3).to_dict(as_series=False))}"
+                )
+    else:
+        frame = frame.with_columns(nw.col(id_col).alias("__hf_leaf__"))
+    return frame
+
+
+def _ids_at_depth(ids: set[str], depth: int) -> set[str]:
+    """Return the identifiers composed of exactly ``depth`` components."""
+    sep = "/"
+    return {value for value in ids if value.count(sep) == depth - 1}
+
+
+def _map_leaf_to_level_ids(leaves, spec, leaf_level, known_ids) -> dict[str, list[str]]:
+    """Map each leaf identifier to the identifier of every level in ``spec``."""
+    leaf_positions = {name: i for i, name in enumerate(leaf_level)}
+    level_positions = [[leaf_positions[name] for name in level] for level in spec]
+    mapping: dict[str, list[str]] = {}
+    for leaf in leaves:
+        parts = leaf.split("/")
+        if len(parts) != len(leaf_level):
+            raise ValueError(
+                f"Leaf identifier {leaf!r} does not have one component per leaf "
+                f"level column {reprlib.repr(list(leaf_level))}."
+            )
+        ids = ["/".join(parts[i] for i in positions) for positions in level_positions]
+        for level, parent_id in zip(spec, ids, strict=True):
+            if parent_id not in known_ids:
+                raise ValueError(
+                    "Correction mapped to an identifier that is not present in "
+                    f"`Y_df`: {parent_id!r} for level {level}. The correction "
+                    "cannot be placed in the existing hierarchy."
+                )
+        mapping[leaf] = ids
+    return mapping
+
+
+def _select_latest_versions(frame, target_cols, version_col, time_col):
+    """Collapse duplicate corrections to the latest version per leaf and date."""
+    frame = frame.with_row_index("__hf_row__")
+    subset = ["__hf_leaf__", time_col]
+    if version_col is not None:
+        return frame.sort([version_col, "__hf_row__"]).unique(
+            subset=subset, keep="last", maintain_order=True
+        )
+
+    grouped = frame.group_by(subset).agg(
+        *[nw.col(col).n_unique().alias(f"__hf_nunique_{col}__") for col in target_cols]
+    )
+    conflicting = grouped.filter(
+        nw.max_horizontal(*[nw.col(f"__hf_nunique_{col}__") for col in target_cols]) > 1
+    )
+    if len(conflicting) > 0:
+        raise ValueError(
+            "`corrections` contains different values for the same leaf and "
+            "timestamp. Provide `version_col` to define which delivery is "
+            "newer: "
+            f"{reprlib.repr(conflicting.head(3).to_dict(as_series=False))}"
+        )
+    return frame.unique(subset=subset, keep="last", maintain_order=True)
 
 
 def aggregate_temporal(

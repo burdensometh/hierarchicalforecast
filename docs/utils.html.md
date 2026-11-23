@@ -22,9 +22,43 @@ external libraries into a compatible data frame format.
 
 ::: hierarchicalforecast.utils.aggregate_temporal
 
+::: hierarchicalforecast.utils.revise
+
 ::: hierarchicalforecast.utils.make_future_dataframe
 
 ::: hierarchicalforecast.utils.get_cross_temporal_tags
+
+## Revising an aggregated hierarchy
+
+Source systems occasionally re-send a bottom (leaf) series for a date that
+was already summarized. `revise` applies those late corrections to an existing
+`aggregate` output, updating the leaf and every parent that contains it by the
+observed difference (`new - old`). Deliveries are treated as a set of latest
+versions, so applying the same correction twice yields the same result.
+
+```python
+from hierarchicalforecast.utils import aggregate, revise
+
+Y_df, S_df, tags = aggregate(df, hierarchy_levels)
+
+# Revised leaf values, delivered after the summary was generated.
+corrections = pd.DataFrame(
+    {
+        "unique_id": ["Australia/ACT/Canberra/Business"],
+        "ds": [Y_df["ds"].min()],
+        "y": [160.0],
+    }
+)
+Y_df = revise(Y_df, corrections, hierarchy_levels)
+
+# Historical-value methods then read the corrected data.
+Y_tilde_df = hrec.reconcile(
+    Y_hat_df=Y_hat_df,
+    Y_df=Y_df,
+    S_df=S_df,
+    tags=tags,
+)
+```
 
 ## Hierarchical Visualization
 

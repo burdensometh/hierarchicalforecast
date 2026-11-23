@@ -19,6 +19,7 @@ from .utils import (
     _is_bottom_identity,
     _is_strictly_hierarchical,
     is_strictly_hierarchical,
+    revise,
 )
 
 
@@ -507,6 +508,9 @@ class HierarchicalReconciliation:
         temporal: bool = False,
         diagnostics: bool = False,
         diagnostics_atol: float = 1e-6,
+        corrections: Frame | None = None,
+        corrections_spec: list[list[str]] | None = None,
+        corrections_version_col: str | None = None,
     ) -> FrameT:
         r"""Hierarchical Reconciliation Method.
 
@@ -552,6 +556,14 @@ class HierarchicalReconciliation:
             temporal (bool, optional): if True, perform temporal reconciliation. Default is False.
             diagnostics (bool, optional): if True, compute coherence diagnostics and store in `self.diagnostics`. Default is False.
             diagnostics_atol (float, optional): absolute tolerance for numerical coherence check. Default is 1e-6.
+            corrections (Optional[Frame], optional): Late leaf corrections to apply to ``Y_df`` before reconciling,
+                as accepted by :func:`~hierarchicalforecast.utils.revise`. Use this so methods that read historical
+                values (e.g. `TopDown(average_proportions)`, `Bootstrap`, `PERMBU`, `Conformal`) consume the corrected
+                data. Corrections are applied only when ``Y_df`` is provided. Default is None.
+            corrections_spec (Optional[list[list[str]]], optional): The level specification used to build ``Y_df``,
+                required together with ``corrections``. Default is None.
+            corrections_version_col (Optional[str], optional): Optional version column in ``corrections`` used to
+                order deliveries, see :func:`~hierarchicalforecast.utils.revise`. Default is None.
 
         Returns:
             (FrameT): DataFrame, with reconciled predictions.
@@ -565,6 +577,24 @@ class HierarchicalReconciliation:
             - `is_coherent`: Whether reconciled forecasts satisfy aggregation constraints (Overall level only)
             - `coherence_max_violation`: Maximum coherence violation (Overall level only)
         """
+        if (corrections is None) != (corrections_spec is None):
+            raise ValueError(
+                "`corrections` and `corrections_spec` must be provided together."
+            )
+        if corrections is not None:
+            if Y_df is None:
+                raise ValueError(
+                    "`corrections` requires `Y_df` so the corrected history is used."
+                )
+            Y_df = revise(
+                Y_df,
+                corrections,
+                corrections_spec,  # type: ignore[arg-type]
+                version_col=corrections_version_col,
+                id_col=id_col,
+                time_col=time_col,
+                target_cols=(target_col,),
+            )
         # To Narwhals
         Y_hat_nw = nw.from_native(Y_hat_df)
         # Accept SMatrix or DataFrame for S_df
@@ -903,6 +933,9 @@ class HierarchicalReconciliation:
         id_col: str = "unique_id",
         time_col: str = "ds",
         target_col: str = "y",
+        corrections: Frame | None = None,
+        corrections_spec: list[list[str]] | None = None,
+        corrections_version_col: str | None = None,
     ) -> FrameT:
         """Bootstraped Hierarchical Reconciliation Method.
 
@@ -922,6 +955,12 @@ class HierarchicalReconciliation:
             id_col (str, optional): column that identifies each serie. Default is "unique_id".
             time_col (str, optional): column that identifies each timestep, its values can be timestamps or integers. Default is "ds".
             target_col (str, optional): column that contains the target. Default is "y".
+            corrections (Optional[Frame], optional): Late leaf corrections applied to ``Y_df`` before reconciling,
+                see :func:`~hierarchicalforecast.utils.revise`. Default is None.
+            corrections_spec (Optional[list[list[str]]], optional): The level specification used to build ``Y_df``,
+                required together with ``corrections``. Default is None.
+            corrections_version_col (Optional[str], optional): Optional version column in ``corrections`` used to
+                order deliveries. Default is None.
 
         Returns:
             (FrameT): DataFrame, with bootstraped reconciled predictions.
@@ -941,6 +980,9 @@ class HierarchicalReconciliation:
                 id_col=id_col,
                 time_col=time_col,
                 target_col=target_col,
+                corrections=corrections,
+                corrections_spec=corrections_spec,
+                corrections_version_col=corrections_version_col,
             )
             Y_tilde_nw = nw.from_native(Y_tilde_df)
             Y_tilde_nw = Y_tilde_nw.with_columns(nw.lit(seed).alias("seed"))

@@ -1397,3 +1397,80 @@ def test_smatrix_revalidates_bottom_identity_after_sparse_matrix_is_exposed():
     sparse_matrix.data[0] = 0.0
 
     assert not smat.check_bottom_identity()
+
+
+# ---------------------------------------------------------------------------
+# Late corrections fed into historical-value reconciliation
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_uses_corrected_history(strict_data, common_data):
+    """Historical-value methods see revised leaves when corrections are passed."""
+    data = strict_data["pandas"]
+    Y_hat, S, Y_train, tags = data["Y_hat_df"], data["S_df"], data["Y_train_df"], data["tags"]
+    spec = common_data["strict_spec"]
+
+    # Correct a bottom-level leaf on a historical timestamp that `TopDown`
+    # uses to estimate its average proportions.
+    leaf_uid = tags[list(tags)[-1]][0]
+    hist_ds = Y_train["ds"].unique()[0]
+    current = float(
+        Y_train.query("unique_id == @leaf_uid and ds == @hist_ds")["y"].iloc[0]
+    )
+    corrections = pd.DataFrame(
+        {"unique_id": [leaf_uid], "ds": [hist_ds], "y": [current + 1000.0]}
+    )
+
+    hrec_base = HierarchicalReconciliation([TopDown(method="average_proportions")])
+    base = hrec_base.reconcile(Y_hat_df=Y_hat, Y_df=Y_train, S_df=S, tags=tags)
+
+    hrec_revised = HierarchicalReconciliation([TopDown(method="average_proportions")])
+    revised = hrec_revised.reconcile(
+        Y_hat_df=Y_hat,
+        Y_df=Y_train,
+        S_df=S,
+        tags=tags,
+        corrections=corrections,
+        corrections_spec=spec,
+    )
+
+    model = "y_model/TopDown_method-average_proportions"
+    base_values = nw.from_native(base)[model].to_numpy()
+    revised_values = nw.from_native(revised)[model].to_numpy()
+    # The corrected history shifts the top-down proportions.
+    assert not np.allclose(base_values, revised_values)
+
+
+def test_reconcile_corrections_require_y_df(strict_data, common_data):
+    data = strict_data["pandas"]
+    Y_hat, S, tags = data["Y_hat_df"], data["S_df"], data["tags"]
+    spec = common_data["strict_spec"]
+    corrections = pd.DataFrame(
+        {"unique_id": [tags[list(tags)[-1]][0]], "ds": [Y_hat["ds"].iloc[0]], "y": [1.0]}
+    )
+    hrec = HierarchicalReconciliation([BottomUp()])
+    with pytest.raises(ValueError, match="requires `Y_df`"):
+        hrec.reconcile(
+            Y_hat_df=Y_hat,
+            S_df=S,
+            tags=tags,
+            corrections=corrections,
+            corrections_spec=spec,
+        )
+
+
+def test_reconcile_corrections_require_spec(strict_data):
+    data = strict_data["pandas"]
+    Y_hat, S, Y_train, tags = data["Y_hat_df"], data["S_df"], data["Y_train_df"], data["tags"]
+    corrections = pd.DataFrame(
+        {"unique_id": [tags[list(tags)[-1]][0]], "ds": [Y_hat["ds"].iloc[0]], "y": [1.0]}
+    )
+    hrec = HierarchicalReconciliation([BottomUp()])
+    with pytest.raises(ValueError, match="must be provided together"):
+        hrec.reconcile(
+            Y_hat_df=Y_hat,
+            Y_df=Y_train,
+            S_df=S,
+            tags=tags,
+            corrections=corrections,
+        )
